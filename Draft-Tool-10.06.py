@@ -25,7 +25,6 @@ import copy
 
 node_distance = 10.0   # default node spacing across and along the road (asked at run time)
 floor_height = None    # default floor height; None = same as node_distance (asked at run time)
-density = 0
 
 # How likely each apartment type is to be picked on each placement round.
 # Weights are relative: 3 is picked three times as often as 1, 0 never.
@@ -39,6 +38,12 @@ apartment_weights = {
     "threebedA": 1,
     "threebedB": 1,
 }
+
+# Density: how likely a round places a shared space instead of an apartment,
+# on the same scale as the apartment weights. With the 7 weights above at 1,
+# shared_space_weight = 1 means about 1 round in 8. 0 = shared space only fills leftover gaps.
+shared_space_weight = 1
+SHARED_SPACE_ROW = "shared space"   # its row name in the weights dialog
 
 #also ask user to select bridge and topo layer
 
@@ -515,31 +520,58 @@ def type_weights(apartment_types, weights: dict[str, float] | None) -> list[floa
         raise ValueError("apartment weights must be >= 0 and not all 0")
     return out
 
+def place_shared_piece(grid: Grid, floor: int) -> Program | None:
+    #One shared piece of random size (S1-S3, smaller if it doesn't fit), placed at the
+    #same sweep position a living room would take: smallest free column on the floor.
+    sizes = ["S3", "S2", "S1", "S0"]
+    start = random.randrange(3)            # S3, S2 or S1 first, then smaller
+    for code in sizes[start:]:
+        s = Program(code)
+        if s.place_first(grid, floor):
+            return s
+    return None
+
 def populate(grid: Grid, floor: int = 0, apartment_types=None, weights=None,
+             shared_weight: float | None = None,
              max_failures: int = 20, fill_shared: bool = True):
-    #Each round pick an apartment type (by weight) and try to place it on the floor.
-    #Stop after max_failures misses in a row or when the floor is full.
-    #Returns (apartments, shared_programs). shared_programs is only the leftover fill;
-    #the 1x1 shared cells that open each living room live on apartment.shared.
+    #Each round pick an apartment type or a shared space (by weight) and place it on the floor.
+    #Stop after max_failures apartment misses in a row or when the floor is full.
+    #Returns (apartments, scattered, filler):
+    #   scattered = shared pieces picked by shared_weight, between apartments
+    #   filler    = shared space filling the leftover gaps at the end
+    #The 1x1 shared cells that open each living room live on apartment.shared.
     if apartment_types is None:
         apartment_types = APARTMENT_TYPES
     if weights is None:
         weights = apartment_weights
-    w = type_weights(apartment_types, weights)
-    apartments = []
+    if shared_weight is None:
+        shared_weight = shared_space_weight
+    if shared_weight < 0:
+        raise ValueError("shared space weight must be >= 0")
+    choices = list(apartment_types) + [None]          # None = shared space
+    w = type_weights(apartment_types, weights) + [float(shared_weight)]
+
+    apartments, scattered = [], []
     failures = 0
     while failures < max_failures and any(n.k == floor for n in grid.free_nodes()):
-        apt = random.choices(apartment_types, weights=w)[0](floor)
+        pick = random.choices(choices, weights=w)[0]
+        if pick is None:
+            piece = place_shared_piece(grid, floor)
+            if piece is not None:
+                scattered.append(piece)
+            continue
+        apt = pick(floor)
         if apt.place(grid):
             apt.number = len(apartments) + 1
             apartments.append(apt)
             failures = 0
         else:
             failures += 1
-    shared = fill_shared_space(grid, floor) if fill_shared else []
-    return apartments, shared
+    filler = fill_shared_space(grid, floor) if fill_shared else []
+    return apartments, scattered, filler
 
-def summary(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program]) -> str:
+def summary(grid: Grid, apartments: Sequence[Apartment], scattered: Sequence[Program],
+            filler: Sequence[Program]) -> str:
     #Text report: total apartments, count per type, count per floor
     total = len(apartments)
     lines = [f"Generated {total} apartments on {grid.shape[2]} floors",
@@ -554,8 +586,16 @@ def summary(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Progra
         n = sum(1 for a in apartments if a.floor == k)
         lines.append(f"  floor {k}  {n:4d}")
     entry = sum(len(a.shared) for a in apartments)
-    lines.append(f"Shared spaces: {entry} 1x1 cells opening living rooms, "
-                 f"{len(shared)} filling leftover gaps")
+    lines.append("Shared spaces:")
+    lines.append(f"  {len(scattered):4d}  placed between apartments (shared space weight)")
+    lines.append(f"  {entry:4d}  1x1 cells opening living rooms")
+    lines.append(f"  {len(filler):4d}  filling leftover gaps")
+
+    # density = share of buildable nodes that ended up as apartments
+    apt_nodes = sum(len(p.nodes) for a in apartments for p in a.programs)
+    buildable = int(np.count_nonzero(~np.isin(grid.states, (ProgramState.OUTSIDE, ProgramState.GROUND))))
+    if buildable:
+        lines.append(f"Density: {100 * apt_nodes / buildable:.1f}% of buildable nodes are apartments")
     lines.append(f"Empty nodes left: {grid.count_free()}")
     return "\n".join(lines)
 
@@ -732,7 +772,8 @@ def add_program(grid: Grid, program: Program, name: str):
     gid = sc.doc.Objects.AddBrep(brep, attr)
     return None if gid == System.Guid.Empty else gid
 
-def draw(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program]) -> None:
+def draw(grid: Grid, apartments: Sequence[Apartment], scattered: Sequence[Program],
+         filler: Sequence[Program]) -> None:
     sc.doc.Views.RedrawEnabled = False
     try:
         for apt in apartments:
@@ -743,8 +784,10 @@ def draw(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program])
             ids = [i for i in ids if i is not None]
             if ids:
                 sc.doc.Groups.Add(List[System.Guid](ids))   # one group per apartment
-        for s in shared:
-            add_program(grid, s, f"shared floor {s.origin.k} - {s.code}")
+        for s in scattered:
+            add_program(grid, s, f"shared floor {s.origin.k} - {s.code} (between apartments)")
+        for s in filler:
+            add_program(grid, s, f"shared floor {s.origin.k} - {s.code} (leftover fill)")
     finally:
         sc.doc.Views.RedrawEnabled = True
         sc.doc.Views.Redraw()
@@ -752,26 +795,35 @@ def draw(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program])
 #=================================================
 #--------------------------------------------- MAIN
 
-def ask_weights(defaults: dict[str, float]) -> dict[str, float] | None:
-    #Dialog with one editable weight per apartment type. Starts from the last values
-    #used this Rhino session (falls back to apartment_weights). None = cancelled.
+def ask_weights(defaults: dict[str, float], shared_default: float):
+    #Dialog with one editable weight per apartment type plus a shared space row.
+    #Starts from the last values used this Rhino session (falls back to the parameters).
+    #Returns (apartment_weights, shared_weight), or None if cancelled.
     names = [t.__name__ for t in APARTMENT_TYPES]
     last = sc.sticky.get("apartment_weights", defaults)
-    values = [f"{last.get(n, defaults.get(n, 1)):g}" for n in names]
-    message = "Relative likelihood of each apartment type (0 = never, 2 = twice as likely as 1)"
+    last_shared = sc.sticky.get("shared_space_weight", shared_default)
+    values = [f"{last.get(n, defaults.get(n, 1)):g}" for n in names] + [f"{last_shared:g}"]
+    message = ("Relative likelihood of each pick per round (0 = never, 2 = twice as likely as 1).\n"
+               f"'{SHARED_SPACE_ROW}' places a shared piece instead of an apartment: higher = less dense.")
     while True:
-        result = rs.PropertyListBox(names, values, message, "Apartment weights")
+        result = rs.PropertyListBox(names + [SHARED_SPACE_ROW], values, message, "Apartment weights")
         if result is None:
             return None
         try:
-            weights = {n: float(v) for n, v in zip(names, result)}
+            nums = [float(v) for v in result]
+            weights = dict(zip(names, nums[:-1]))
+            shared_weight = nums[-1]
             type_weights(APARTMENT_TYPES, weights)   # same checks populate uses
+            if shared_weight < 0:
+                raise ValueError("shared space weight must be >= 0")
         except ValueError as e:
-            rs.MessageBox(f"Invalid weights: {e}\nUse numbers >= 0, not all 0.", 0, "Apartment weights")
+            rs.MessageBox(f"Invalid weights: {e}\nUse numbers >= 0; apartment weights not all 0.",
+                          0, "Apartment weights")
             values = list(result)
             continue
         sc.sticky["apartment_weights"] = weights
-        return weights
+        sc.sticky["shared_space_weight"] = shared_weight
+        return weights, shared_weight
 
 def main():
     road = pick_road()
@@ -787,25 +839,27 @@ def main():
     fh = rs.GetReal("Floor height", floor_height or dist, 0.001)
     if fh is None:
         return
-    weights = ask_weights(apartment_weights)
-    if weights is None:
+    asked = ask_weights(apartment_weights, shared_space_weight)
+    if asked is None:
         return
+    weights, shared_weight = asked
 
     # ----- generate (internal only, nothing drawn yet)
     grid = build_grid(road, topo, dist, fh)
     if grid is None:
         return
-    apartments, shared = [], []
+    apartments, scattered, filler = [], [], []
     for k in range(grid.shape[2]):
-        a, s = populate(grid, floor=k, weights=weights)
+        a, s, f = populate(grid, floor=k, weights=weights, shared_weight=shared_weight)
         apartments += a
-        shared += s
+        scattered += s
+        filler += f
     for n, apt in enumerate(apartments, 1):
         apt.number = n
 
     # ----- draw everything at the end
-    draw(grid, apartments, shared)
-    print(summary(grid, apartments, shared))
+    draw(grid, apartments, scattered, filler)
+    print(summary(grid, apartments, scattered, filler))
 
 if __name__ == "__main__":
     main()
