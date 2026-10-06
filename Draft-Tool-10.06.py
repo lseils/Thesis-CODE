@@ -88,7 +88,11 @@ class ProgramState(IntEnum):
     BEDROOM = 4
     KITCHEN = 5
     BATHROOM = 6
-    OUTSIDE = 7   # past the road edge or below the topo, never buildable
+    OUTSIDE = 7   # past the road edge / off the topo: open air, never buildable
+    GROUND = 8    # below the topo: solid earth, never buildable
+
+# what a living room may face on its open side
+OPEN_STATES = (ProgramState.OUTSIDE, ProgramState.SHARED)
 
 FACE_OFFSETS = np.array([
     (1, 0, 0), (-1, 0, 0),
@@ -166,6 +170,10 @@ class Grid:
     def is_empty(self, i: int, j: int, k: int) -> bool:
         return self.in_bounds(i, j, k) and self.states[i, j, k] == ProgramState.EMPTY
 
+    def is_open(self, i: int, j: int, k: int) -> bool:
+        #Off the grid, open air past the road edge, or shared space (not earth, not a room)
+        return not self.in_bounds(i, j, k) or self.states[i, j, k] in OPEN_STATES
+
     def occupy(self, i: int, j: int, k: int, state: ProgramState = ProgramState.USED) -> None:
         self.states[i, j, k] = state
 
@@ -228,13 +236,20 @@ class ProgramLayout(IntEnum):
     OXW = 0   # One x Two
     WXW = 1   # tWo x Two
     HXW = 2   # tHree x Two
+    OXO = 3   # One x One
 
-LAYOUT_WIDTH = {ProgramLayout.OXW: 1, ProgramLayout.WXW: 2, ProgramLayout.HXW: 3}
-PROGRAM_DEPTH = 2    # every layout is 2 nodes deep
+# (width, depth) in nodes for each layout
+LAYOUT_SIZE = {
+    ProgramLayout.OXO: (1, 1),
+    ProgramLayout.OXW: (1, 2),
+    ProgramLayout.WXW: (2, 2),
+    ProgramLayout.HXW: (3, 2),
+}
 PROGRAM_HEIGHT = 1   # every program sits on one floor
 
-# code -> (state, layout). The number in the code is the width in nodes.
+# code -> (state, layout). The number in the code is the width in nodes (S0 = 1x1).
 PROGRAMS = {
+    "S0":  (ProgramState.SHARED,   ProgramLayout.OXO),
     "L1":  (ProgramState.LIVING,   ProgramLayout.OXW),
     "L2":  (ProgramState.LIVING,   ProgramLayout.WXW),
     "BA":  (ProgramState.BATHROOM, ProgramLayout.OXW),
@@ -281,10 +296,21 @@ class Program:
 
     def footprint(self, rotated: bool = False) -> tuple[int, int, int]:
         #(di, dj, dk) size of the box in nodes
-        w = LAYOUT_WIDTH[self.layout]
+        w, d = LAYOUT_SIZE[self.layout]
         if rotated:
-            return PROGRAM_DEPTH, w, PROGRAM_HEIGHT
-        return w, PROGRAM_DEPTH, PROGRAM_HEIGHT
+            return d, w, PROGRAM_HEIGHT
+        return w, d, PROGRAM_HEIGHT
+
+    def sides(self) -> dict[str, list[Node]]:
+        #The 4 rows of nodes just outside the placed box, in plan (may be out of bounds)
+        i, j, k = self.origin
+        di, dj, _ = self.footprint(self.rotated)
+        return {
+            "-i": [Node(i - 1, j + b, k) for b in range(dj)],
+            "+i": [Node(i + di, j + b, k) for b in range(dj)],
+            "-j": [Node(i + a, j - 1, k) for a in range(di)],
+            "+j": [Node(i + a, j + dj, k) for a in range(di)],
+        }
 
     def check_conflict(self, grid: Grid, i: int, j: int, k: int, rotated: bool = False) -> bool:
         #True if the box at (i, j, k) runs out of bounds or hits a used node
@@ -340,7 +366,8 @@ class Program:
         return any(self.try_place_at(grid, n) for n in self.first_anchors(grid, k))
 
     def place_adjacent(self, grid: Grid, placed: Sequence[Program]) -> bool:
-        #Other programs: start from an empty node touching an already placed program
+        #Other programs: start from an empty node touching one of the placed programs,
+        #so the box always shares at least one face with them (same floor)
         frontier = sorted({n for p in placed for node in p.nodes
                            for n in grid.empty_neighbors(node) if n.k == node.k})
         random.shuffle(frontier)
@@ -368,6 +395,7 @@ class Apartment:
         self.programs = [Program(code) for code in programs]
         self.floor = floor
         self.number = number
+        self.shared: list[Program] = []   # 1x1 shared cells that open up the living room
 
     def __repr__(self) -> str:
         return f"Apartment({self.type} #{self.number}, floor {self.floor}, {self.programs})"
@@ -396,7 +424,9 @@ class Apartment:
         return cls("threebedB", ["L2", "BA", "BA", "BR2", "BR2", "BR1", "K2"], floor)
 
     def place(self, grid: Grid) -> bool:
-        #Living first, then every other program next to what is already placed.
+        #Living first. Then:
+        #  - one full side of the living room must be open (road edge / off the grid / shared space)
+        #  - every other room must touch the living room (at least one face)
         #If the rest doesn't fit around that Living, undo and try the next Living spot.
         #If no Living spot works, the grid is left unchanged and this returns False.
         living = [p for p in self.programs if p.type == ProgramState.LIVING]
@@ -415,14 +445,39 @@ class Apartment:
                 continue
             tried.add(key)
 
-            placed = [first]
+            if self.place_around_living(grid, first, rest):
+                return True
+            first.remove(grid)
+        return False
+
+    def place_around_living(self, grid: Grid, living: Program, rest: Sequence[Program]) -> bool:
+        #Make sure the living room has an open side, then put every room against it.
+        #If no side is open yet, a side of empty nodes is turned into 1x1 shared space (S0).
+        sides = list(living.sides().values())
+        random.shuffle(sides)
+        if any(all(grid.is_open(*n) for n in side) for side in sides):
+            openings = [[]]                    # already open, nothing to add
+        else:
+            openings = [[n for n in side if not grid.is_open(*n)]
+                        for side in sides
+                        if all(grid.is_open(*n) or grid.is_empty(*n) for n in side)]
+
+        for to_open in openings:
+            entry = []
+            for n in to_open:
+                s = Program("S0")
+                s.try_place_at(grid, n)        # n is empty, so a 1x1 always fits
+                entry.append(s)
+
+            placed = []
             for p in rest:
-                if not p.place_adjacent(grid, placed):
+                if not p.place_adjacent(grid, [living]):
                     break
                 placed.append(p)
             else:
+                self.shared = entry
                 return True
-            for q in placed:
+            for q in placed + entry:
                 q.remove(grid)
         return False
 
@@ -434,13 +489,13 @@ APARTMENT_TYPES = [
 
 #______________________________
 def fill_shared_space(grid: Grid, floor: int = 0) -> list[Program]:
-    #Leftover gaps become shared space, biggest piece first (S3 -> S2 -> S1).
-    #A single node with no empty neighbor stays EMPTY.
+    #Runs after all apartments on the floor are placed.
+    #Leftover gaps become shared space, biggest piece first (S3 -> S2 -> S1 -> S0).
     shared = []
     for node in grid.free_nodes():
         if node.k != floor or not grid.is_empty(*node):
             continue
-        for code in ("S3", "S2", "S1"):
+        for code in ("S3", "S2", "S1", "S0"):
             s = Program(code)
             if s.try_place_at(grid, node):
                 shared.append(s)
@@ -464,7 +519,8 @@ def populate(grid: Grid, floor: int = 0, apartment_types=None, weights=None,
              max_failures: int = 20, fill_shared: bool = True):
     #Each round pick an apartment type (by weight) and try to place it on the floor.
     #Stop after max_failures misses in a row or when the floor is full.
-    #Returns (apartments, shared_programs).
+    #Returns (apartments, shared_programs). shared_programs is only the leftover fill;
+    #the 1x1 shared cells that open each living room live on apartment.shared.
     if apartment_types is None:
         apartment_types = APARTMENT_TYPES
     if weights is None:
@@ -497,7 +553,10 @@ def summary(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Progra
     for k in range(grid.shape[2]):
         n = sum(1 for a in apartments if a.floor == k)
         lines.append(f"  floor {k}  {n:4d}")
-    lines.append(f"Shared spaces: {len(shared)}, empty nodes left: {grid.count_free()}")
+    entry = sum(len(a.shared) for a in apartments)
+    lines.append(f"Shared spaces: {entry} 1x1 cells opening living rooms, "
+                 f"{len(shared)} filling leftover gaps")
+    lines.append(f"Empty nodes left: {grid.count_free()}")
     return "\n".join(lines)
 
 
@@ -509,7 +568,8 @@ def summary(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Progra
 # Each cell's top corners sit on the road. A cell is only buildable when
 #   - all 4 of its top corners are inside the road edges (contained under the road)
 #   - its bottom is still above the topo at all 4 corners (standing on the topo)
-# Everything else is marked OUTSIDE, so programs can never be placed there.
+# Columns past the road edge are marked OUTSIDE (open air), cells under the topo GROUND (earth).
+# Programs can never be placed on either; only OUTSIDE counts as open for a living room.
 
 def closest_point_on(crv, pt):
     ok, t = crv.ClosestPoint(pt)
@@ -581,7 +641,9 @@ def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.nda
 
     grid = Grid(positions, corners)
     below_topo = np.arange(n_z)[None, None, :] >= levels[:, :, None]
-    grid.states[below_topo] = ProgramState.OUTSIDE
+    off_site = np.broadcast_to(~finite[:, :, None], below_topo.shape)
+    grid.states[below_topo] = ProgramState.GROUND
+    grid.states[off_site] = ProgramState.OUTSIDE   # past the road edge or no topo below
     return grid
 
 def build_grid(road, topo, node_distance: float, floor_height: float) -> Grid | None:
@@ -676,6 +738,8 @@ def draw(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program])
         for apt in apartments:
             ids = [add_program(grid, p, f"{apt.type} #{apt.number} floor {apt.floor} - {p.code}")
                    for p in apt.programs]
+            ids += [add_program(grid, s, f"{apt.type} #{apt.number} floor {apt.floor} - living room opening")
+                    for s in apt.shared]
             ids = [i for i in ids if i is not None]
             if ids:
                 sc.doc.Groups.Add(List[System.Guid](ids))   # one group per apartment
@@ -687,6 +751,27 @@ def draw(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program])
 
 #=================================================
 #--------------------------------------------- MAIN
+
+def ask_weights(defaults: dict[str, float]) -> dict[str, float] | None:
+    #Dialog with one editable weight per apartment type. Starts from the last values
+    #used this Rhino session (falls back to apartment_weights). None = cancelled.
+    names = [t.__name__ for t in APARTMENT_TYPES]
+    last = sc.sticky.get("apartment_weights", defaults)
+    values = [f"{last.get(n, defaults.get(n, 1)):g}" for n in names]
+    message = "Relative likelihood of each apartment type (0 = never, 2 = twice as likely as 1)"
+    while True:
+        result = rs.PropertyListBox(names, values, message, "Apartment weights")
+        if result is None:
+            return None
+        try:
+            weights = {n: float(v) for n, v in zip(names, result)}
+            type_weights(APARTMENT_TYPES, weights)   # same checks populate uses
+        except ValueError as e:
+            rs.MessageBox(f"Invalid weights: {e}\nUse numbers >= 0, not all 0.", 0, "Apartment weights")
+            values = list(result)
+            continue
+        sc.sticky["apartment_weights"] = weights
+        return weights
 
 def main():
     road = pick_road()
@@ -702,6 +787,9 @@ def main():
     fh = rs.GetReal("Floor height", floor_height or dist, 0.001)
     if fh is None:
         return
+    weights = ask_weights(apartment_weights)
+    if weights is None:
+        return
 
     # ----- generate (internal only, nothing drawn yet)
     grid = build_grid(road, topo, dist, fh)
@@ -709,7 +797,7 @@ def main():
         return
     apartments, shared = [], []
     for k in range(grid.shape[2]):
-        a, s = populate(grid, floor=k)
+        a, s = populate(grid, floor=k, weights=weights)
         apartments += a
         shared += s
     for n, apt in enumerate(apartments, 1):
