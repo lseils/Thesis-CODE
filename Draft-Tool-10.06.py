@@ -27,6 +27,19 @@ node_distance = 10.0   # default node spacing across and along the road (asked a
 floor_height = None    # default floor height; None = same as node_distance (asked at run time)
 density = 0
 
+# How likely each apartment type is to be picked on each placement round.
+# Weights are relative: 3 is picked three times as often as 1, 0 never.
+# Big apartments fail to fit more often, so the final mix leans smaller than the weights.
+apartment_weights = {
+    "onebedA":   1,
+    "onebedB":   1,
+    "onebedC":   1,
+    "twobedA":   1,
+    "twobedB":   1,
+    "threebedA": 1,
+    "threebedB": 1,
+}
+
 #also ask user to select bridge and topo layer
 
 #=================================================
@@ -209,27 +222,6 @@ class Grid:
     def free_nodes(self) -> list[Node]:
         return [Node(*map(int, c)) for c in np.argwhere(self.states == ProgramState.EMPTY)]
 
-    #Use
-    # pts = []
-    # for i in range(6):
-    #     angle = i * np.pi / 10
-    #     for j in range(3):
-    #         r = 10 + j * 2
-    #         for k in range(4):
-    #             pts.append((r * np.cos(angle), r * np.sin(angle), k * 3.0))
-
-    # g = Grid.from_points(pts, n_div=6, n_off=3, n_z=4)
-    # assert g.shape == (6, 3, 4)
-    # assert g.place_box(0, 0, 0, 2, 2, 2)
-    # assert not g.box_fits(1, 1, 1, 2, 2, 2)      # overlaps
-    # assert not g.box_fits(5, 0, 0, 2, 1, 1)      # runs off the end of the curve
-    # assert g.count_free() == 72 - 8
-    # assert g.first_free() == Node(0, 0, 2)
-    # assert len(list(g.neighbors(Node(0, 0, 0)))) == 3
-    # assert g.nearest_node(*g.position(Node(4, 2, 3))) == Node(4, 2, 3)
-    # assert g.nearest_node(12.1, 0.1, 5.8) == Node(0, 1, 2)
-    # assert g.box_corners(0, 0, 0, 2, 2, 2).shape == (8, 3)
-    # print("all checks passed")
         
 #______________________________
 class ProgramLayout(IntEnum):
@@ -382,14 +374,14 @@ class Apartment:
 
     # -- presets (edit these to change what each apartment holds)
     @classmethod
-    def studio(cls, floor: int = 0):
-        return cls("studio", ["L1", "BA", "K1"], floor)
-    @classmethod
     def onebedA(cls, floor: int = 0):
-        return cls("onebedA", ["L1", "BA", "BR1", "K1"], floor)
+        return cls("onebedA", ["L1", "BA", "K1"], floor)
     @classmethod
     def onebedB(cls, floor: int = 0):
-        return cls("onebedB", ["L2", "BA", "BR1", "K1"], floor)
+        return cls("onebedB", ["L1", "BA", "BR1", "K1"], floor)
+    @classmethod
+    def onebedC(cls, floor: int = 0):
+        return cls("onebedC", ["L2", "BA", "BR1", "K1"], floor)
     @classmethod
     def twobedA(cls, floor: int = 0):
         return cls("twobedA", ["L2", "BA", "BR1", "BR1", "K1"], floor)
@@ -435,7 +427,7 @@ class Apartment:
         return False
 
 APARTMENT_TYPES = [
-    Apartment.studio, Apartment.onebedA, Apartment.onebedB,
+    Apartment.onebedA, Apartment.onebedB, Apartment.onebedC,
     Apartment.twobedA, Apartment.twobedB,
     Apartment.threebedA, Apartment.threebedB,
 ]
@@ -455,17 +447,33 @@ def fill_shared_space(grid: Grid, floor: int = 0) -> list[Program]:
                 break
     return shared
 
-def populate(grid: Grid, floor: int = 0, apartment_types=None,
+def type_weights(apartment_types, weights: dict[str, float] | None) -> list[float]:
+    #One weight per apartment type, looked up by preset name (missing names count as 1)
+    if weights is None:
+        return [1.0] * len(apartment_types)
+    names = {t.__name__ for t in apartment_types}
+    unknown = set(weights) - names
+    if unknown:
+        raise ValueError(f"unknown apartment types in weights: {sorted(unknown)}")
+    out = [float(weights.get(t.__name__, 1)) for t in apartment_types]
+    if any(w < 0 for w in out) or sum(out) == 0:
+        raise ValueError("apartment weights must be >= 0 and not all 0")
+    return out
+
+def populate(grid: Grid, floor: int = 0, apartment_types=None, weights=None,
              max_failures: int = 20, fill_shared: bool = True):
-    #Each round pick a random apartment type and try to place it on the floor.
+    #Each round pick an apartment type (by weight) and try to place it on the floor.
     #Stop after max_failures misses in a row or when the floor is full.
     #Returns (apartments, shared_programs).
     if apartment_types is None:
         apartment_types = APARTMENT_TYPES
+    if weights is None:
+        weights = apartment_weights
+    w = type_weights(apartment_types, weights)
     apartments = []
     failures = 0
     while failures < max_failures and any(n.k == floor for n in grid.free_nodes()):
-        apt = random.choice(apartment_types)(floor)
+        apt = random.choices(apartment_types, weights=w)[0](floor)
         if apt.place(grid):
             apt.number = len(apartments) + 1
             apartments.append(apt)
@@ -474,6 +482,23 @@ def populate(grid: Grid, floor: int = 0, apartment_types=None,
             failures += 1
     shared = fill_shared_space(grid, floor) if fill_shared else []
     return apartments, shared
+
+def summary(grid: Grid, apartments: Sequence[Apartment], shared: Sequence[Program]) -> str:
+    #Text report: total apartments, count per type, count per floor
+    total = len(apartments)
+    lines = [f"Generated {total} apartments on {grid.shape[2]} floors",
+             "By type:"]
+    width = max(len(t.__name__) for t in APARTMENT_TYPES)
+    for t in APARTMENT_TYPES:
+        n = sum(1 for a in apartments if a.type == t.__name__)
+        pct = f"{100 * n / total:5.1f}%" if total else "    -"
+        lines.append(f"  {t.__name__:<{width}}  {n:4d}  {pct}")
+    lines.append("By floor (0 = right under the road):")
+    for k in range(grid.shape[2]):
+        n = sum(1 for a in apartments if a.floor == k)
+        lines.append(f"  floor {k}  {n:4d}")
+    lines.append(f"Shared spaces: {len(shared)}, empty nodes left: {grid.count_free()}")
+    return "\n".join(lines)
 
 
 
@@ -612,11 +637,11 @@ def build_grid(road, topo, node_distance: float, floor_height: float) -> Grid | 
 
 LAYER_ROOT = "Apartments"
 PROGRAM_COLORS = {
-    ProgramState.LIVING:   (230, 159, 0),
-    ProgramState.BEDROOM:  (86, 180, 233),
-    ProgramState.KITCHEN:  (0, 158, 115),
-    ProgramState.BATHROOM: (204, 121, 167),
-    ProgramState.SHARED:   (160, 160, 160),
+    ProgramState.LIVING:   (129, 113, 68), # Olive Wood
+    ProgramState.BEDROOM:  (69, 87, 34), # Olive Leaf
+    ProgramState.KITCHEN:  (161, 144, 96), # Camel
+    ProgramState.BATHROOM: (81, 86, 71), # Ebony
+    ProgramState.SHARED:   (41, 76, 96), # Charcoal Blue
 }
 
 def program_layer(state: ProgramState) -> int:
@@ -692,8 +717,7 @@ def main():
 
     # ----- draw everything at the end
     draw(grid, apartments, shared)
-    print(f"{grid.shape[2]} floors, {len(apartments)} apartments, {len(shared)} shared spaces, "
-          f"{grid.count_free()} empty nodes left")
+    print(summary(grid, apartments, shared))
 
 if __name__ == "__main__":
     main()
