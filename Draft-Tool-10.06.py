@@ -42,12 +42,13 @@ apartment_weights = {
 # Density: how likely a round places a shared space instead of an apartment,
 # on the same scale as the apartment weights. With the 7 weights above at 1,
 # shared_space_weight = 1 means about 1 round in 8. 0 = shared space only fills leftover gaps.
-shared_space_weight = 1
-SHARED_SPACE_ROW = "shared space"   # its row name in the weights dialog
+shared_space_weight = 1   # the only weight asked at run time; apartment weights are set here only
 
 # Vertical circulation: one 1x3 core every this many nodes along the road (asked at run time).
 # Cores are placed before any apartment and run from the top floor down to the topo.
 vertcirc_spacing = 20
+# On every floor, at least this share of the buildable cells touching a core become shared space.
+core_shared_share = 0.5
 
 # Obstacles (other roads, structures...) under the main road: nothing is built within this
 # clearance above them, but the space between the clearance and the main road is still buildable.
@@ -559,6 +560,34 @@ def place_vertcirc(grid: Grid, spacing: int = vertcirc_spacing) -> list[Program]
         cores.append(core)
     return cores
 
+def place_core_shared(grid: Grid, cores: Sequence[Program], share: float = core_shared_share) -> list[Program]:
+    #Runs right after place_vertcirc, before any apartment. On every floor, at least `share`
+    #of the buildable cells touching a core's sides become 1x1 shared space (S0).
+    #Order: one long side in full, then the ends, then the other long side.
+    #The same side comes first on every floor, so the shared space stacks.
+    shared = []
+    for core in cores:
+        sides = list(core.sides().values())
+        random.shuffle(sides)
+        sides.sort(key=len, reverse=True)      # long sides first, random which one leads
+        order = sides[0] + sides[2] + sides[3] + sides[1]
+        k0, dk = core.origin.k, core.height
+        for k in range(k0, k0 + dk):
+            cells = [Node(n.i, n.j, k) for n in order]
+            cells = [c for c in cells if grid.in_bounds(*c)
+                     and grid.get_state(*c) not in (ProgramState.OUTSIDE, ProgramState.GROUND)]
+            needed = math.ceil(share * len(cells))
+            needed -= sum(1 for c in cells if grid.get_state(*c) == ProgramState.SHARED)
+            for c in cells:
+                if needed <= 0:
+                    break
+                if grid.is_empty(*c):
+                    s = Program("S0")
+                    s.try_place_at(grid, c)
+                    shared.append(s)
+                    needed -= 1
+    return shared
+
 def fill_shared_space(grid: Grid, floor: int = 0) -> list[Program]:
     #Runs after all apartments on the floor are placed.
     #Leftover gaps become shared space, biggest piece first (S3 -> S2 -> S1 -> S0).
@@ -636,8 +665,9 @@ def populate(grid: Grid, floor: int = 0, apartment_types=None, weights=None,
     filler = fill_shared_space(grid, floor) if fill_shared else []
     return apartments, scattered, filler
 
-def summary(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment],
-            scattered: Sequence[Program], filler: Sequence[Program]) -> str:
+def summary(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
+            apartments: Sequence[Apartment], scattered: Sequence[Program],
+            filler: Sequence[Program]) -> str:
     #Text report: total apartments, count per type, count per floor
     total = len(apartments)
     lines = [f"Generated {total} apartments on {grid.shape[2]} floors",
@@ -656,6 +686,7 @@ def summary(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment
     lines.append(f"  {len(scattered):4d}  placed between apartments (shared space weight)")
     lines.append(f"  {entry:4d}  1x1 cells opening living rooms")
     lines.append(f"  {len(filler):4d}  filling leftover gaps")
+    lines.append(f"  {len(core_shared):4d}  1x1 cells around vertical circulation")
     lines.append(f"Vertical circulation: {len(cores)} cores")
 
     # density = share of buildable nodes that ended up as apartments
@@ -885,12 +916,15 @@ def add_program(grid: Grid, program: Program, name: str):
     gid = sc.doc.Objects.AddBrep(brep, attr)
     return None if gid == System.Guid.Empty else gid
 
-def draw(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment],
-         scattered: Sequence[Program], filler: Sequence[Program]) -> None:
+def draw(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
+         apartments: Sequence[Apartment], scattered: Sequence[Program],
+         filler: Sequence[Program]) -> None:
     sc.doc.Views.RedrawEnabled = False
     try:
         for n, c in enumerate(cores, 1):
             add_program(grid, c, f"vertical circulation #{n} - {c.height} floors")
+        for s in core_shared:
+            add_program(grid, s, f"shared floor {s.origin.k} - {s.code} (around vertical circulation)")
         for apt in apartments:
             ids = [add_program(grid, p, f"{apt.type} #{apt.number} floor {apt.floor} - {p.code}")
                    for p in apt.programs]
@@ -910,35 +944,16 @@ def draw(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment],
 #=================================================
 #--------------------------------------------- MAIN
 
-def ask_weights(defaults: dict[str, float], shared_default: float):
-    #Dialog with one editable weight per apartment type plus a shared space row.
-    #Starts from the last values used this Rhino session (falls back to the parameters).
-    #Returns (apartment_weights, shared_weight), or None if cancelled.
-    names = [t.__name__ for t in APARTMENT_TYPES]
-    last = sc.sticky.get("apartment_weights", defaults)
-    last_shared = sc.sticky.get("shared_space_weight", shared_default)
-    values = [f"{last.get(n, defaults.get(n, 1)):g}" for n in names] + [f"{last_shared:g}"]
-    message = ("Relative likelihood of each pick per round (0 = never, 2 = twice as likely as 1).\n"
-               f"'{SHARED_SPACE_ROW}' places a shared piece instead of an apartment: higher = less dense.")
-    while True:
-        result = rs.PropertyListBox(names + [SHARED_SPACE_ROW], values, message, "Apartment weights")
-        if result is None:
-            return None
-        try:
-            nums = [float(v) for v in result]
-            weights = dict(zip(names, nums[:-1]))
-            shared_weight = nums[-1]
-            type_weights(APARTMENT_TYPES, weights)   # same checks populate uses
-            if shared_weight < 0:
-                raise ValueError("shared space weight must be >= 0")
-        except ValueError as e:
-            rs.MessageBox(f"Invalid weights: {e}\nUse numbers >= 0; apartment weights not all 0.",
-                          0, "Apartment weights")
-            values = list(result)
-            continue
-        sc.sticky["apartment_weights"] = weights
-        sc.sticky["shared_space_weight"] = shared_weight
-        return weights, shared_weight
+def ask_shared_weight(default: float):
+    #Ask for the shared space weight only (apartment weights are fixed in the parameters).
+    #Starts from the last value used this Rhino session (falls back to the parameter).
+    #Returns the weight, or None if cancelled.
+    last = sc.sticky.get("shared_space_weight", default)
+    shared_weight = rs.GetReal("Shared space weight (higher = more shared space, less dense)", last, 0.0)
+    if shared_weight is None:
+        return None
+    sc.sticky["shared_space_weight"] = shared_weight
+    return shared_weight
 
 def main():
     road = pick_road()
@@ -966,19 +981,19 @@ def main():
     spacing = rs.GetInteger("Vertical circulation spacing (nodes)", vertcirc_spacing, 1)
     if spacing is None:
         return
-    asked = ask_weights(apartment_weights, shared_space_weight)
-    if asked is None:
+    shared_weight = ask_shared_weight(shared_space_weight)
+    if shared_weight is None:
         return
-    weights, shared_weight = asked
 
     # ----- generate (internal only, nothing drawn yet)
     grid = build_grid(road, topo, dist, fh, obstacles, clearance)
     if grid is None:
         return
     cores = place_vertcirc(grid, spacing)
+    core_shared = place_core_shared(grid, cores)
     apartments, scattered, filler = [], [], []
     for k in range(grid.shape[2]):
-        a, s, f = populate(grid, floor=k, weights=weights, shared_weight=shared_weight)
+        a, s, f = populate(grid, floor=k, shared_weight=shared_weight)
         apartments += a
         scattered += s
         filler += f
@@ -986,8 +1001,8 @@ def main():
         apt.number = n
 
     # ----- draw everything at the end
-    draw(grid, cores, apartments, scattered, filler)
-    print(summary(grid, cores, apartments, scattered, filler))
+    draw(grid, cores, core_shared, apartments, scattered, filler)
+    print(summary(grid, cores, core_shared, apartments, scattered, filler))
 
 if __name__ == "__main__":
     main()
