@@ -45,6 +45,15 @@ apartment_weights = {
 shared_space_weight = 1
 SHARED_SPACE_ROW = "shared space"   # its row name in the weights dialog
 
+# Vertical circulation: one 1x3 core every this many nodes along the road (asked at run time).
+# Cores are placed before any apartment and run from the top floor down to the topo.
+vertcirc_spacing = 20
+
+# Obstacles (other roads, structures...) under the main road: nothing is built within this
+# clearance above them, but the space between the clearance and the main road is still buildable.
+obstacle_clearance_ft = 16.0   # in feet, converted to model units (asked at run time)
+obstacle_samples = 5           # rays per cell side when looking for obstacles (5 = 25 rays per column)
+
 #also ask user to select bridge and topo layer
 
 #=================================================
@@ -67,10 +76,8 @@ def pick_road():
     ref = get_one("Select the road surface", OT.Surface | OT.PolysrfFilter)
     return ref.Brep() if ref else None
 
-def pick_topo():
-    ref = get_one("Select the Topo (mesh or surface)", OT.Mesh | OT.Surface | OT.PolysrfFilter)
-    if ref is None:
-            return None
+def ref_to_mesh(ref):
+    #Selected mesh as-is, or a surface / polysurface meshed into one mesh (None if it fails)
     mesh = ref.Mesh()
     if mesh is not None:
         return mesh
@@ -80,6 +87,34 @@ def pick_topo():
     joined = rg.Mesh()
     for m in parts:
         joined.Append(m)
+    return joined
+
+def pick_topo():
+    ref = get_one("Select the Topo (mesh or surface)", OT.Mesh | OT.Surface | OT.PolysrfFilter)
+    if ref is None:
+        return None
+    return ref_to_mesh(ref)
+
+def pick_obstacles():
+    #Optional obstacles under the road, joined into one mesh.
+    #Returns an empty mesh if Enter is pressed (no obstacles), None if cancelled.
+    go = Rhino.Input.Custom.GetObject()
+    go.SetCommandPrompt("Select obstacles under the road (Enter for none)")
+    go.GeometryFilter = OT.Mesh | OT.Surface | OT.PolysrfFilter
+    go.SubObjectSelect = False
+    go.EnablePreSelect(False, True)
+    go.AcceptNothing(True)
+
+    res = go.GetMultiple(1, 0)
+    joined = rg.Mesh()
+    if res == Rhino.Input.GetResult.Nothing:
+        return joined
+    if res != Rhino.Input.GetResult.Object:
+        return None
+    for n in range(go.ObjectCount):
+        mesh = ref_to_mesh(go.Object(n))
+        if mesh is not None:
+            joined.Append(mesh)
     return joined
 
 #=================================================
@@ -95,6 +130,7 @@ class ProgramState(IntEnum):
     BATHROOM = 6
     OUTSIDE = 7   # past the road edge / off the topo: open air, never buildable
     GROUND = 8    # below the topo: solid earth, never buildable
+    VERTCIRC = 9  # vertical circulation core, spans every floor
 
 # what a living room may face on its open side
 OPEN_STATES = (ProgramState.OUTSIDE, ProgramState.SHARED)
@@ -242,29 +278,32 @@ class ProgramLayout(IntEnum):
     WXW = 1   # tWo x Two
     HXW = 2   # tHree x Two
     OXO = 3   # One x One
+    OXH = 4   # One x tHree
 
 # (width, depth) in nodes for each layout
 LAYOUT_SIZE = {
     ProgramLayout.OXO: (1, 1),
+    ProgramLayout.OXH: (1, 3),
     ProgramLayout.OXW: (1, 2),
     ProgramLayout.WXW: (2, 2),
     ProgramLayout.HXW: (3, 2),
 }
-PROGRAM_HEIGHT = 1   # every program sits on one floor
+PROGRAM_HEIGHT = 1   # every program sits on one floor (except vertical circulation)
 
 # code -> (state, layout). The number in the code is the width in nodes (S0 = 1x1).
 PROGRAMS = {
     "S0":  (ProgramState.SHARED,   ProgramLayout.OXO),
-    "L1":  (ProgramState.LIVING,   ProgramLayout.OXW),
-    "L2":  (ProgramState.LIVING,   ProgramLayout.WXW),
+    "L1":  (ProgramState.LIVING,   ProgramLayout.WXW),
+    "L2":  (ProgramState.LIVING,   ProgramLayout.HXW),
     "BA":  (ProgramState.BATHROOM, ProgramLayout.OXW),
     "BR1": (ProgramState.BEDROOM,  ProgramLayout.WXW),
     "BR2": (ProgramState.BEDROOM,  ProgramLayout.HXW),
-    "K1":  (ProgramState.KITCHEN,  ProgramLayout.WXW),
-    "K2":  (ProgramState.KITCHEN,  ProgramLayout.HXW),
+    "K1":  (ProgramState.KITCHEN,  ProgramLayout.OXW),
+    "K2":  (ProgramState.KITCHEN,  ProgramLayout.WXW),
     "S1":  (ProgramState.SHARED,   ProgramLayout.OXW),
     "S2":  (ProgramState.SHARED,   ProgramLayout.WXW),
     "S3":  (ProgramState.SHARED,   ProgramLayout.HXW),
+    "VC":  (ProgramState.VERTCIRC, ProgramLayout.OXH),
 }
 
 #______________________________
@@ -273,11 +312,13 @@ class Program:
     #rotated=True swaps width and depth (the box turns 90 degrees in plan).
     #A program only exists in the grid after try_place_at / place_first / place_adjacent succeeds.
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, height: int = PROGRAM_HEIGHT):
+        #height = floors the box spans downward from its origin (only vertical circulation uses > 1)
         if code not in PROGRAMS:
             raise ValueError(f"unknown program code {code!r}")
         self.code = code
         self.type, self.layout = PROGRAMS[code]
+        self.height = height
         self.origin: Node | None = None
         self.rotated = False
         self.nodes: list[Node] = []
@@ -303,8 +344,8 @@ class Program:
         #(di, dj, dk) size of the box in nodes
         w, d = LAYOUT_SIZE[self.layout]
         if rotated:
-            return d, w, PROGRAM_HEIGHT
-        return w, d, PROGRAM_HEIGHT
+            return d, w, self.height
+        return w, d, self.height
 
     def sides(self) -> dict[str, list[Node]]:
         #The 4 rows of nodes just outside the placed box, in plan (may be out of bounds)
@@ -417,7 +458,7 @@ class Apartment:
         return cls("onebedC", ["L2", "BA", "BR1", "K1"], floor)
     @classmethod
     def twobedA(cls, floor: int = 0):
-        return cls("twobedA", ["L2", "BA", "BR1", "BR1", "K1"], floor)
+        return cls("twobedA", ["L2", "BA", "BR1", "BR1", "K2"], floor)
     @classmethod
     def twobedB(cls, floor: int = 0):
         return cls("twobedB", ["L2", "BA", "BA", "BR2", "BR1", "K2"], floor)
@@ -493,6 +534,31 @@ APARTMENT_TYPES = [
 ]
 
 #______________________________
+def place_vertcirc(grid: Grid, spacing: int = vertcirc_spacing) -> list[Program]:
+    #Runs before any apartment. One 1x3 core every `spacing` nodes along the road,
+    #its 3-node length across the road, centered on the centerline.
+    #The series is centered along the road so both ends have the same leftover gap.
+    #Each core runs from the top floor (k=0) down as far as all 3 of its columns are buildable.
+    n_div, n_off, n_z = grid.shape
+    w, d = LAYOUT_SIZE[ProgramLayout.OXH]
+    if n_off < d:
+        print("Road is too narrow for vertical circulation")
+        return []
+    j = (n_off - d) // 2
+    start = ((n_div - 1) % spacing) // 2
+    cores = []
+    for i in range(start, n_div, spacing):
+        dk = 0
+        while dk < n_z and grid.box_fits(i, j, 0, w, d, dk + 1):
+            dk += 1
+        if dk == 0:
+            print(f"No room for vertical circulation at node {i} along the road")
+            continue
+        core = Program("VC", height=dk)
+        core.try_place_at(grid, Node(i, j, 0))   # the box at the anchor fits, checked above
+        cores.append(core)
+    return cores
+
 def fill_shared_space(grid: Grid, floor: int = 0) -> list[Program]:
     #Runs after all apartments on the floor are placed.
     #Leftover gaps become shared space, biggest piece first (S3 -> S2 -> S1 -> S0).
@@ -570,8 +636,8 @@ def populate(grid: Grid, floor: int = 0, apartment_types=None, weights=None,
     filler = fill_shared_space(grid, floor) if fill_shared else []
     return apartments, scattered, filler
 
-def summary(grid: Grid, apartments: Sequence[Apartment], scattered: Sequence[Program],
-            filler: Sequence[Program]) -> str:
+def summary(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment],
+            scattered: Sequence[Program], filler: Sequence[Program]) -> str:
     #Text report: total apartments, count per type, count per floor
     total = len(apartments)
     lines = [f"Generated {total} apartments on {grid.shape[2]} floors",
@@ -590,6 +656,7 @@ def summary(grid: Grid, apartments: Sequence[Apartment], scattered: Sequence[Pro
     lines.append(f"  {len(scattered):4d}  placed between apartments (shared space weight)")
     lines.append(f"  {entry:4d}  1x1 cells opening living rooms")
     lines.append(f"  {len(filler):4d}  filling leftover gaps")
+    lines.append(f"Vertical circulation: {len(cores)} cores")
 
     # density = share of buildable nodes that ended up as apartments
     apt_nodes = sum(len(p.nodes) for a in apartments for p in a.programs)
@@ -608,7 +675,9 @@ def summary(grid: Grid, apartments: Sequence[Apartment], scattered: Sequence[Pro
 # Each cell's top corners sit on the road. A cell is only buildable when
 #   - all 4 of its top corners are inside the road edges (contained under the road)
 #   - its bottom is still above the topo at all 4 corners (standing on the topo)
-# Columns past the road edge are marked OUTSIDE (open air), cells under the topo GROUND (earth).
+#   - its bottom is still above the clearance line of any obstacle under it
+# Columns past the road edge and cells in an obstacle's clearance are marked OUTSIDE (open air),
+# cells under the topo GROUND (earth).
 # Programs can never be placed on either; only OUTSIDE counts as open for a living room.
 
 def closest_point_on(crv, pt):
@@ -653,10 +722,13 @@ def road_frame(centerline, edges, s):
     return p, sides
 
 def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.ndarray,
-                           floor_height: float, tol: float = 0.0) -> Grid | None:
+                           floor_height: float, tol: float = 0.0,
+                           obstacle_depth: np.ndarray | None = None) -> Grid | None:
     #top:       (n_div+1, n_off+1, 3) corner points on the road surface
     #corner_ok: (n_div+1, n_off+1) True where the corner is inside the road edges
     #depth:     (n_div+1, n_off+1) distance straight down to the topo (nan = no topo below)
+    #obstacle_depth: optional (n_div, n_off) distance down to the clearance line above an
+    #           obstacle, per column of cells (inf = no obstacle below)
     d = np.where(corner_ok & np.isfinite(depth), depth, -np.inf)
 
     # a column of cells is only as deep as its shallowest corner
@@ -665,7 +737,15 @@ def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.nda
     finite = np.isfinite(col)
     levels[finite] = np.floor((col[finite] + tol) / floor_height).astype(int)
     levels = np.maximum(levels, 0)
-    n_z = int(levels.max()) if levels.size else 0
+
+    # floors above an obstacle's clearance line (never deeper than the topo)
+    open_levels = levels.copy()
+    if obstacle_depth is not None:
+        hit = np.isfinite(obstacle_depth)
+        above = np.floor((obstacle_depth[hit] + tol) / floor_height).astype(int)
+        open_levels[hit] = np.minimum(levels[hit], np.maximum(above, 0))
+
+    n_z = int(open_levels.max()) if open_levels.size else 0
     if n_z == 0:
         return None
 
@@ -680,13 +760,40 @@ def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.nda
                     for a in (0, 1) for b in (0, 1) for c in (0, 1)) / 8.0
 
     grid = Grid(positions, corners)
-    below_topo = np.arange(n_z)[None, None, :] >= levels[:, :, None]
+    ks = np.arange(n_z)[None, None, :]
+    in_clearance = ks >= open_levels[:, :, None]
+    below_topo = ks >= levels[:, :, None]
     off_site = np.broadcast_to(~finite[:, :, None], below_topo.shape)
+    grid.states[in_clearance] = ProgramState.OUTSIDE   # open air above an obstacle
     grid.states[below_topo] = ProgramState.GROUND
     grid.states[off_site] = ProgramState.OUTSIDE   # past the road edge or no topo below
     return grid
 
-def build_grid(road, topo, node_distance: float, floor_height: float) -> Grid | None:
+def obstacle_clearance_depth(top: np.ndarray, corner_ok: np.ndarray, obstacles,
+                             clearance: float, samples: int = obstacle_samples) -> np.ndarray:
+    #(n_div, n_off) distance down from the road each column of cells may reach before it gets
+    #within `clearance` of an obstacle (inf = no obstacle below). Each column is sampled on a
+    #samples x samples grid of rays, so an obstacle narrower than a cell is still found.
+    down = rg.Vector3d(0, 0, -1)
+    n_div, n_off = top.shape[0] - 1, top.shape[1] - 1
+    out = np.full((n_div, n_off), np.inf)
+    s = np.linspace(0.0, 1.0, samples)
+    for b in range(n_div):
+        for c in range(n_off):
+            if not corner_ok[b:b + 2, c:c + 2].all():
+                continue                       # off site anyway
+            p00, p10, p11, p01 = top[b, c], top[b + 1, c], top[b + 1, c + 1], top[b, c + 1]
+            for u in s:
+                for v in s:
+                    x, y, z = (1 - u) * (1 - v) * p00 + u * (1 - v) * p10 + u * v * p11 + (1 - u) * v * p01
+                    t = Intersection.MeshRay(obstacles, rg.Ray3d(rg.Point3d(float(x), float(y), float(z)), down))
+                    if t >= 0:
+                        out[b, c] = min(out[b, c], t - clearance)
+    return out
+
+def build_grid(road, topo, node_distance: float, floor_height: float,
+               obstacles=None, clearance: float = 0.0) -> Grid | None:
+    #obstacles: optional mesh of things under the road to keep `clearance` above
     tol = sc.doc.ModelAbsoluteTolerance
     guides = road_guides(road)
     if guides is None:
@@ -727,8 +834,13 @@ def build_grid(road, topo, node_distance: float, floor_height: float) -> Grid | 
                 if t >= 0:
                     depth[b, c] = t
 
-    # ----- 4. stack floors down to the topo
-    grid = grid_from_road_samples(top, corner_ok, depth, floor_height, tol)
+    # ----- 4. obstacles: stop each column short of the clearance above them
+    obstacle_depth = None
+    if obstacles is not None and obstacles.Faces.Count > 0:
+        obstacle_depth = obstacle_clearance_depth(top, corner_ok, obstacles, clearance)
+
+    # ----- 5. stack floors down to the topo / obstacle clearance
+    grid = grid_from_road_samples(top, corner_ok, depth, floor_height, tol, obstacle_depth)
     if grid is None:
         print("No room for a single floor between the road and the topo")
     return grid
@@ -744,6 +856,7 @@ PROGRAM_COLORS = {
     ProgramState.KITCHEN:  (161, 144, 96), # Camel
     ProgramState.BATHROOM: (81, 86, 71), # Ebony
     ProgramState.SHARED:   (41, 76, 96), # Charcoal Blue
+    ProgramState.VERTCIRC: (0, 27, 46),   # Prussian Blue
 }
 
 def program_layer(state: ProgramState) -> int:
@@ -772,10 +885,12 @@ def add_program(grid: Grid, program: Program, name: str):
     gid = sc.doc.Objects.AddBrep(brep, attr)
     return None if gid == System.Guid.Empty else gid
 
-def draw(grid: Grid, apartments: Sequence[Apartment], scattered: Sequence[Program],
-         filler: Sequence[Program]) -> None:
+def draw(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment],
+         scattered: Sequence[Program], filler: Sequence[Program]) -> None:
     sc.doc.Views.RedrawEnabled = False
     try:
+        for n, c in enumerate(cores, 1):
+            add_program(grid, c, f"vertical circulation #{n} - {c.height} floors")
         for apt in apartments:
             ids = [add_program(grid, p, f"{apt.type} #{apt.number} floor {apt.floor} - {p.code}")
                    for p in apt.programs]
@@ -832,6 +947,15 @@ def main():
     topo = pick_topo()
     if topo is None:
         return
+    obstacles = pick_obstacles()
+    if obstacles is None:
+        return
+    clearance = 0.0
+    if obstacles.Faces.Count > 0:
+        ft = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Feet, sc.doc.ModelUnitSystem)
+        clearance = rs.GetReal("Clearance above obstacles (model units)", obstacle_clearance_ft * ft, 0.0)
+        if clearance is None:
+            return
 
     dist = rs.GetReal("Node distance", node_distance, 0.001)
     if dist is None:
@@ -839,15 +963,19 @@ def main():
     fh = rs.GetReal("Floor height", floor_height or dist, 0.001)
     if fh is None:
         return
+    spacing = rs.GetInteger("Vertical circulation spacing (nodes)", vertcirc_spacing, 1)
+    if spacing is None:
+        return
     asked = ask_weights(apartment_weights, shared_space_weight)
     if asked is None:
         return
     weights, shared_weight = asked
 
     # ----- generate (internal only, nothing drawn yet)
-    grid = build_grid(road, topo, dist, fh)
+    grid = build_grid(road, topo, dist, fh, obstacles, clearance)
     if grid is None:
         return
+    cores = place_vertcirc(grid, spacing)
     apartments, scattered, filler = [], [], []
     for k in range(grid.shape[2]):
         a, s, f = populate(grid, floor=k, weights=weights, shared_weight=shared_weight)
@@ -858,8 +986,8 @@ def main():
         apt.number = n
 
     # ----- draw everything at the end
-    draw(grid, apartments, scattered, filler)
-    print(summary(grid, apartments, scattered, filler))
+    draw(grid, cores, apartments, scattered, filler)
+    print(summary(grid, cores, apartments, scattered, filler))
 
 if __name__ == "__main__":
     main()
