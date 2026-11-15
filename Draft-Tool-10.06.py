@@ -55,6 +55,29 @@ core_shared_share = 0.5
 obstacle_clearance_ft = 16.0   # in feet, converted to model units (asked at run time)
 obstacle_samples = 5           # rays per cell side when looking for obstacles (5 = 25 rays per column)
 
+# ---- Conditions (only used when "Conditions" is picked at run time)
+# Ground engagement: Public pods at an interval along the road. Each pod stands on the topo,
+# spills past the road edges in steps (widest at the ground and next to the building, shorter
+# the further out it reaches) and rises a few floors, each floor smaller than the one below.
+# Everywhere else, the floor touching the topo is left empty (open air).
+ge_spacing = 23      # nodes between pod centers along the road (asked at run time)
+ge_length = 10       # pod length along the road on the ground floor, in nodes (asked at run time)
+ge_spill = 4         # nodes the pod reaches past each road edge on the ground floor (asked at run time)
+ge_floors = 2        # floors of public, counted up from the topo (asked at run time)
+ge_taper = 1         # each step further out past the road edge, the pod is this many nodes shorter at each end
+ge_floor_step = 2    # each floor up, the pod is this many nodes shorter at each end and spills this many fewer
+ge_void = 0.08       # share of each pod's nodes randomly left as voids (open air), 0 = solid (asked at run time)
+
+# Pathway engagement: wherever an obstacle (a road or path picked as an obstacle) crosses under
+# the road, a ground engagement pod is centered on the crossing. The pod is the crossing plus
+# `pe_width` nodes on each side of it; wherever the crossing (its clearance) actually is, the pod's
+# nodes are voided, so the growth stands on the topo on both sides of the crossing road.
+# The steps taper the same way as ground engagement (ge_taper, ge_floor_step).
+pe_width = 5         # pod growth along the road on each side of the crossing, ground floor, in nodes (asked)
+pe_spill = 4         # nodes the pod reaches past each road edge on the ground floor (asked at run time)
+pe_floors = 2        # floors of public, counted up from the topo (asked at run time)
+pe_void = 0.08       # share of each pod's nodes randomly left as voids (asked at run time)
+
 #also ask user to select bridge and topo layer
 
 #=================================================
@@ -132,9 +155,10 @@ class ProgramState(IntEnum):
     OUTSIDE = 7   # past the road edge / off the topo: open air, never buildable
     GROUND = 8    # below the topo: solid earth, never buildable
     VERTCIRC = 9  # vertical circulation core, spans every floor
+    PUBLIC = 10   # ground / pathway engagement: public space
 
 # what a living room may face on its open side
-OPEN_STATES = (ProgramState.OUTSIDE, ProgramState.SHARED)
+OPEN_STATES = (ProgramState.OUTSIDE, ProgramState.SHARED, ProgramState.PUBLIC)
 
 FACE_OFFSETS = np.array([
     (1, 0, 0), (-1, 0, 0),
@@ -162,6 +186,25 @@ class Grid:
         self.corners = corners
         self.shape = positions.shape[:3]
         self.states = np.full(self.shape, ProgramState.EMPTY, dtype=np.uint8)
+        # per column (i, j), filled in by grid_from_road_samples:
+        #   levels      = floors that fit between the road and the topo
+        #   open_levels = floors above any obstacle's clearance (<= levels)
+        #   in_road     = True if the column is under the road
+        self.levels: np.ndarray | None = None
+        self.open_levels: np.ndarray | None = None
+        self.in_road: np.ndarray | None = None
+        # filled in by build_grid: distance down from the road to the top of an obstacle,
+        # per column (inf = no obstacle below), and the floor height
+        self.obstacle_hit: np.ndarray | None = None
+        self.floor_height: float | None = None
+
+    def ground_k(self, i: int, j: int) -> int | None:
+        #k of the cell standing on the topo in column (i, j), or None
+        #(no topo below, or the column is cut short by an obstacle's clearance)
+        lv, op = int(self.levels[i, j]), int(self.open_levels[i, j])
+        if lv < 1 or op < lv or lv > self.shape[2]:
+            return None
+        return lv - 1
 
     @classmethod
     def from_points(cls, points: Sequence[tuple[float, float, float]],
@@ -588,6 +631,177 @@ def place_core_shared(grid: Grid, cores: Sequence[Program], share: float = core_
                     needed -= 1
     return shared
 
+#______________________________
+class Block:
+    #A free-size box of cells with one state. Used for public space, whose shape
+    #comes from the engagement steps instead of a fixed layout.
+    #condition = which condition made it ("Ground engagement"...), group = its pod / wing name
+    def __init__(self, state: ProgramState, i: int, j: int, k: int, di: int, dj: int,
+                 condition: str = "", group: str = ""):
+        self.type = state
+        self.code = "P"
+        self.origin = Node(i, j, k)
+        self.size = (di, dj, 1)
+        self.condition = condition
+        self.group = group
+        self.nodes = [Node(a, b, k) for a in range(i, i + di) for b in range(j, j + dj)]
+
+    def world_corners(self, grid: Grid) -> np.ndarray:
+        return grid.cell_corners(*self.origin, *self.size)
+
+def merge_cells(cells: set[Node]) -> list[tuple[int, int, int, int, int]]:
+    #Merge cells into as few boxes as possible: runs along i, then equal runs side by side in j.
+    #Returns (i, j, k, di, dj) per box.
+    runs = {}                                   # (k, i0, di) -> sorted j list
+    for (k, j) in sorted({(c.k, c.j) for c in cells}):
+        row = sorted(c.i for c in cells if c.k == k and c.j == j)
+        start = prev = row[0]
+        for i in row[1:] + [None]:
+            if i is not None and i == prev + 1:
+                prev = i
+                continue
+            runs.setdefault((k, start, prev - start + 1), []).append(j)
+            if i is not None:
+                start = prev = i
+    boxes = []
+    for (k, i0, di), js in runs.items():
+        j0 = prev = js[0]
+        for j in js[1:] + [None]:
+            if j is not None and j == prev + 1:
+                prev = j
+                continue
+            boxes.append((i0, j0, k, di, prev - j0 + 1))
+            if j is not None:
+                j0 = prev = j
+    return boxes
+
+def pod_centers(n_div: int, spacing: int) -> list[float]:
+    #Pod centers along the road (index i), `spacing` apart, the series centered on the road length
+    count = max(1, n_div // spacing)
+    mid = (n_div - 1) / 2
+    return [mid + (p - (count - 1) / 2) * spacing for p in range(count)]
+
+def build_pod(grid: Grid, center: float, length: int, spill: int, floors: int,
+              taper: int = ge_taper, floor_step: int = ge_floor_step) -> set[Node]:
+    #One stepped public pod centered on `center` (index i along the road), standing on the topo.
+    #A cell only becomes public if it is still empty or open air, so cores, other public space and
+    #anything in an obstacle's clearance (columns cut by an obstacle have no ground cell) stay as they are.
+    n_div, n_off, _ = grid.shape
+    pod = set()
+    for f in range(floors):
+        reach = spill - floor_step * f
+        for s in range(max(reach, 0) + 1):
+            run = length - 2 * floor_step * f - 2 * taper * s
+            if run <= 0:
+                break
+            i0 = int(math.floor(center - run / 2 + 0.5))
+            for i in range(max(i0, 0), min(i0 + run, n_div)):
+                road_js = np.flatnonzero(grid.in_road[i])
+                if road_js.size == 0:
+                    continue
+                lo, hi = int(road_js.min()), int(road_js.max())
+                js = range(lo, hi + 1) if s == 0 else (lo - s, hi + s)
+                for j in js:
+                    if not 0 <= j < n_off:
+                        continue
+                    kg = grid.ground_k(i, j)
+                    if kg is None or kg - f < 0:
+                        continue
+                    k = kg - f
+                    if grid.states[i, j, k] in (ProgramState.EMPTY, ProgramState.OUTSIDE):
+                        grid.states[i, j, k] = ProgramState.PUBLIC
+                        pod.add(Node(i, j, k))
+    return pod
+
+def place_ground_engagement(grid: Grid, spacing: int = ge_spacing, length: int = ge_length,
+                            spill: int = ge_spill, floors: int = ge_floors,
+                            taper: int = ge_taper, floor_step: int = ge_floor_step,
+                            void: float = ge_void) -> tuple[list[Block], int]:
+    #Runs after place_vertcirc, before anything else. Builds the public pods, then leaves
+    #the floor touching the topo empty everywhere else.
+    #Returns (public blocks, number of void nodes).
+    #A pod on floor f (0 = the cell on the topo) is made of steps s:
+    #   s = 0         the road's own columns, `length - 2 * floor_step * f` nodes long
+    #   s = 1, 2, ... one column further out past each road edge, `2 * taper` nodes shorter per step,
+    #                 up to `spill - floor_step * f` columns out
+    #Every step and floor is centered on the pod center, so each one sits on the one below.
+    n_div = grid.shape[0]
+    cells_by_pod = [build_pod(grid, center, length, spill, floors, taper, floor_step)
+                    for center in pod_centers(n_div, spacing)]
+
+    voids = carve_voids(grid, cells_by_pod, void)
+
+    # the floor touching the topo stays empty under the rest of the road
+    for i in range(n_div):
+        for j in np.flatnonzero(grid.in_road[i]):
+            kg = grid.ground_k(i, int(j))
+            if kg is not None and grid.states[i, j, kg] == ProgramState.EMPTY:
+                grid.states[i, j, kg] = ProgramState.OUTSIDE
+
+    blocks = []
+    for n, pod in enumerate(cells_by_pod, 1):
+        if pod:
+            blocks += [Block(ProgramState.PUBLIC, *box, condition="Ground engagement",
+                             group=f"ground engagement pod #{n}") for box in merge_cells(pod)]
+    return blocks, voids
+
+def carve_voids(grid: Grid, groups: Sequence[set[Node]], void: float) -> int:
+    #Random voids: about `void` of each group's public nodes are left as open air, so the steps
+    #aren't perfect. Only nodes with no public directly above them, so nothing upstairs floats.
+    #Removes the voids from the groups and returns how many there are.
+    voids = 0
+    for cells in groups:
+        tops = sorted(n for n in cells if Node(n.i, n.j, n.k - 1) not in cells)
+        for n in random.sample(tops, min(len(tops), round(void * len(cells)))):
+            grid.states[n] = ProgramState.OUTSIDE
+            cells.discard(n)
+            voids += 1
+    return voids
+
+def find_crossings(grid: Grid) -> list[tuple[int, int, float]]:
+    #Runs of nodes along the road (i) where an obstacle cuts in under the road.
+    #Returns (first i, last i, pathway depth) per crossing; pathway depth = distance down
+    #from the road to the highest obstacle surface in that run.
+    if grid.obstacle_hit is None:
+        return []
+    cut = grid.in_road & np.isfinite(grid.obstacle_hit) & (grid.open_levels < grid.levels)
+    rows = cut.any(axis=1)
+    crossings, i, n_div = [], 0, grid.shape[0]
+    while i < n_div:
+        if not rows[i]:
+            i += 1
+            continue
+        start = i
+        while i + 1 < n_div and rows[i + 1]:
+            i += 1
+        depth = float(grid.obstacle_hit[start:i + 1][cut[start:i + 1]].min())
+        crossings.append((start, i, depth))
+        i += 1
+    return crossings
+
+def place_pathway_engagement(grid: Grid, width: int = pe_width, spill: int = pe_spill,
+                             floors: int = pe_floors, void: float = pe_void,
+                             taper: int = ge_taper, floor_step: int = ge_floor_step) -> tuple[list[Block], int, int]:
+    #Runs after place_ground_engagement (if any), before shared space and apartments.
+    #For each crossing, a ground engagement pod centered on it, as long as the crossing plus
+    #`width` nodes on each side. The crossing's own columns (the obstacle and its clearance) have
+    #no ground cell, so they are voided automatically and the pod grows on both sides of it.
+    #Returns (public blocks, number of crossings, number of void nodes).
+    crossings = find_crossings(grid)
+    pods = []
+    for start, end, _ in crossings:
+        center = (start + end) / 2
+        length = (end - start + 1) + 2 * width
+        pods.append(build_pod(grid, center, length, spill, floors, taper, floor_step))
+
+    voids = carve_voids(grid, pods, void)
+    blocks = []
+    for n, pod in enumerate(pods, 1):
+        if pod:
+            blocks += [Block(ProgramState.PUBLIC, *box, condition="Pathway engagement",
+                             group=f"pathway engagement pod #{n}") for box in merge_cells(pod)]
+    return blocks, len(crossings), voids
+
 def fill_shared_space(grid: Grid, floor: int = 0) -> list[Program]:
     #Runs after all apartments on the floor are placed.
     #Leftover gaps become shared space, biggest piece first (S3 -> S2 -> S1 -> S0).
@@ -667,7 +881,8 @@ def populate(grid: Grid, floor: int = 0, apartment_types=None, weights=None,
 
 def summary(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
             apartments: Sequence[Apartment], scattered: Sequence[Program],
-            filler: Sequence[Program]) -> str:
+            filler: Sequence[Program], public: Sequence[Block] = (),
+            voids: dict[str, int] | None = None, crossings: int = 0) -> str:
     #Text report: total apartments, count per type, count per floor
     total = len(apartments)
     lines = [f"Generated {total} apartments on {grid.shape[2]} floors",
@@ -688,6 +903,16 @@ def summary(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program]
     lines.append(f"  {len(filler):4d}  filling leftover gaps")
     lines.append(f"  {len(core_shared):4d}  1x1 cells around vertical circulation")
     lines.append(f"Vertical circulation: {len(cores)} cores")
+    voids = voids or {}
+    for condition, unit in (("Ground engagement", "pods"), ("Pathway engagement", "pods")):
+        blocks = [b for b in public if b.condition == condition]
+        if not blocks and condition not in voids:
+            continue
+        groups = len({b.group for b in blocks})
+        cells = sum(len(b.nodes) for b in blocks)
+        extra = f"{crossings} crossings, " if condition == "Pathway engagement" else ""
+        lines.append(f"{condition}: {extra}{groups} public {unit}, {cells} public nodes"
+                     f" in {len(blocks)} boxes, {voids.get(condition, 0)} void nodes")
 
     # density = share of buildable nodes that ended up as apartments
     apt_nodes = sum(len(p.nodes) for a in apartments for p in a.programs)
@@ -710,6 +935,9 @@ def summary(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program]
 # Columns past the road edge and cells in an obstacle's clearance are marked OUTSIDE (open air),
 # cells under the topo GROUND (earth).
 # Programs can never be placed on either; only OUTSIDE counts as open for a living room.
+# With ground engagement on, the grid is `margin` columns wider on each side of the road.
+# Those extra columns are OUTSIDE too, but the topo is sampled under them so public pods
+# can step out past the road edge and stand on the topo.
 
 def closest_point_on(crv, pt):
     ok, t = crv.ClosestPoint(pt)
@@ -760,7 +988,7 @@ def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.nda
     #depth:     (n_div+1, n_off+1) distance straight down to the topo (nan = no topo below)
     #obstacle_depth: optional (n_div, n_off) distance down to the clearance line above an
     #           obstacle, per column of cells (inf = no obstacle below)
-    d = np.where(corner_ok & np.isfinite(depth), depth, -np.inf)
+    d = np.where(np.isfinite(depth), depth, -np.inf)
 
     # a column of cells is only as deep as its shallowest corner
     col = np.minimum.reduce([d[:-1, :-1], d[1:, :-1], d[1:, 1:], d[:-1, 1:]])
@@ -768,6 +996,10 @@ def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.nda
     finite = np.isfinite(col)
     levels[finite] = np.floor((col[finite] + tol) / floor_height).astype(int)
     levels = np.maximum(levels, 0)
+
+    # under the road = all 4 top corners inside the road edges, with topo below
+    ok = corner_ok.astype(bool)
+    in_road = ok[:-1, :-1] & ok[1:, :-1] & ok[1:, 1:] & ok[:-1, 1:] & finite
 
     # floors above an obstacle's clearance line (never deeper than the topo)
     open_levels = levels.copy()
@@ -791,17 +1023,19 @@ def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.nda
                     for a in (0, 1) for b in (0, 1) for c in (0, 1)) / 8.0
 
     grid = Grid(positions, corners)
+    grid.levels, grid.open_levels, grid.in_road = levels, open_levels, in_road
     ks = np.arange(n_z)[None, None, :]
     in_clearance = ks >= open_levels[:, :, None]
     below_topo = ks >= levels[:, :, None]
-    off_site = np.broadcast_to(~finite[:, :, None], below_topo.shape)
+    off_site = np.broadcast_to(~in_road[:, :, None], below_topo.shape)
     grid.states[in_clearance] = ProgramState.OUTSIDE   # open air above an obstacle
     grid.states[below_topo] = ProgramState.GROUND
     grid.states[off_site] = ProgramState.OUTSIDE   # past the road edge or no topo below
     return grid
 
-def obstacle_clearance_depth(top: np.ndarray, corner_ok: np.ndarray, obstacles,
+def obstacle_clearance_depth(top: np.ndarray, sampled: np.ndarray, obstacles,
                              clearance: float, samples: int = obstacle_samples) -> np.ndarray:
+    #sampled: (n_div+1, n_off+1) True where the corner has topo below (other columns are skipped)
     #(n_div, n_off) distance down from the road each column of cells may reach before it gets
     #within `clearance` of an obstacle (inf = no obstacle below). Each column is sampled on a
     #samples x samples grid of rays, so an obstacle narrower than a cell is still found.
@@ -811,7 +1045,7 @@ def obstacle_clearance_depth(top: np.ndarray, corner_ok: np.ndarray, obstacles,
     s = np.linspace(0.0, 1.0, samples)
     for b in range(n_div):
         for c in range(n_off):
-            if not corner_ok[b:b + 2, c:c + 2].all():
+            if not sampled[b:b + 2, c:c + 2].all():
                 continue                       # off site anyway
             p00, p10, p11, p01 = top[b, c], top[b + 1, c], top[b + 1, c + 1], top[b, c + 1]
             for u in s:
@@ -823,8 +1057,9 @@ def obstacle_clearance_depth(top: np.ndarray, corner_ok: np.ndarray, obstacles,
     return out
 
 def build_grid(road, topo, node_distance: float, floor_height: float,
-               obstacles=None, clearance: float = 0.0) -> Grid | None:
+               obstacles=None, clearance: float = 0.0, margin: int = 0) -> Grid | None:
     #obstacles: optional mesh of things under the road to keep `clearance` above
+    #margin: extra columns past each road edge (ground engagement), topo sampled under them
     tol = sc.doc.ModelAbsoluteTolerance
     guides = road_guides(road)
     if guides is None:
@@ -846,7 +1081,8 @@ def build_grid(road, topo, node_distance: float, floor_height: float,
     if m == 0:
         print("Road is narrower than one node distance")
         return None
-    n_off = 2 * m
+    half = m + margin
+    n_off = 2 * half
 
     # ----- 3. road-level corners: inside the road edges? how far down to the topo?
     down = rg.Vector3d(0, 0, -1)
@@ -855,12 +1091,12 @@ def build_grid(road, topo, node_distance: float, floor_height: float,
     depth = np.full((n_div + 1, n_off + 1), np.nan)
     for b, (p, sides) in enumerate(frames):
         for c in range(n_off + 1):
-            x = (c - m) * node_distance          # > 0 toward edge_a, < 0 toward edge_b
+            x = (c - half) * node_distance       # > 0 toward edge_a, < 0 toward edge_b
             v, width = sides[0] if x > 0 else sides[1]
             pt = p + v * abs(x)
             top[b, c] = (pt.X, pt.Y, pt.Z)
             corner_ok[b, c] = abs(x) <= width + tol
-            if corner_ok[b, c]:
+            if corner_ok[b, c] or margin > 0:
                 t = Intersection.MeshRay(topo, rg.Ray3d(pt, down))
                 if t >= 0:
                     depth[b, c] = t
@@ -868,12 +1104,16 @@ def build_grid(road, topo, node_distance: float, floor_height: float,
     # ----- 4. obstacles: stop each column short of the clearance above them
     obstacle_depth = None
     if obstacles is not None and obstacles.Faces.Count > 0:
-        obstacle_depth = obstacle_clearance_depth(top, corner_ok, obstacles, clearance)
+        obstacle_depth = obstacle_clearance_depth(top, np.isfinite(depth), obstacles, clearance)
 
     # ----- 5. stack floors down to the topo / obstacle clearance
     grid = grid_from_road_samples(top, corner_ok, depth, floor_height, tol, obstacle_depth)
     if grid is None:
         print("No room for a single floor between the road and the topo")
+        return None
+    grid.floor_height = floor_height
+    grid.obstacle_hit = (obstacle_depth + clearance if obstacle_depth is not None
+                         else np.full(grid.shape[:2], np.inf))
     return grid
 
 #=================================================
@@ -888,6 +1128,7 @@ PROGRAM_COLORS = {
     ProgramState.BATHROOM: (81, 86, 71), # Ebony
     ProgramState.SHARED:   (41, 76, 96), # Charcoal Blue
     ProgramState.VERTCIRC: (0, 27, 46),   # Prussian Blue
+    ProgramState.PUBLIC:   (214, 204, 178), # Bone
 }
 
 def program_layer(state: ProgramState) -> int:
@@ -918,9 +1159,15 @@ def add_program(grid: Grid, program: Program, name: str):
 
 def draw(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
          apartments: Sequence[Apartment], scattered: Sequence[Program],
-         filler: Sequence[Program]) -> None:
+         filler: Sequence[Program], public: Sequence[Block] = ()) -> None:
     sc.doc.Views.RedrawEnabled = False
     try:
+        for group in sorted({b.group for b in public}):
+            ids = [add_program(grid, b, f"public floor {b.origin.k} - {group}")
+                   for b in public if b.group == group]
+            ids = [i for i in ids if i is not None]
+            if ids:
+                sc.doc.Groups.Add(List[System.Guid](ids))   # one group per pod / wing
         for n, c in enumerate(cores, 1):
             add_program(grid, c, f"vertical circulation #{n} - {c.height} floors")
         for s in core_shared:
@@ -955,6 +1202,91 @@ def ask_shared_weight(default: float):
     sc.sticky["shared_space_weight"] = shared_weight
     return shared_weight
 
+# condition key -> option name shown in the command line (no spaces allowed)
+CONDITIONS = {
+    "ground_engagement": "GroundEngagement",
+    "pathway_engagement": "PathwayEngagement",
+}
+
+def ask_conditions():
+    #Normal, or Conditions with an On/Off toggle per condition.
+    #Starts from the last choices made this Rhino session.
+    #Returns {condition: bool} (all False for Normal), or None if cancelled.
+    mode = rs.GetString("Generation mode", sc.sticky.get("generation_mode", "Normal"),
+                        ["Normal", "Conditions"])
+    if mode is None:
+        return None
+    mode = "Conditions" if mode.lower().startswith("c") else "Normal"
+    sc.sticky["generation_mode"] = mode
+    if mode == "Normal":
+        return {key: False for key in CONDITIONS}
+
+    last = sc.sticky.get("conditions", {key: True for key in CONDITIONS})
+    go = Rhino.Input.Custom.GetOption()
+    go.SetCommandPrompt("Conditions to turn on (Enter when done)")
+    go.AcceptNothing(True)
+    toggles = {}
+    for key, label in CONDITIONS.items():
+        toggles[key] = Rhino.Input.Custom.OptionToggle(last.get(key, True), "Off", "On")
+        go.AddOptionToggle(label, toggles[key])
+    while True:
+        res = go.Get()
+        if res == Rhino.Input.GetResult.Option:
+            continue
+        if res == Rhino.Input.GetResult.Nothing:
+            break
+        return None
+    on = {key: bool(t.CurrentValue) for key, t in toggles.items()}
+    sc.sticky["conditions"] = on
+    return on
+
+def ask_ground_engagement():
+    #Pod settings, starting from the last values used this Rhino session.
+    #Returns (spacing, length, spill, floors, void), or None if cancelled.
+    defaults = (ge_spacing, ge_length, ge_spill, ge_floors, ge_void)
+    last = sc.sticky.get("ground_engagement", defaults)
+    if len(last) != len(defaults):          # saved by an older version of this script
+        last = defaults
+    prompts = ("Ground engagement: nodes between pod centers",
+               "Ground engagement: pod length along the road (nodes)",
+               "Ground engagement: spill past each road edge (nodes)",
+               "Ground engagement: public floors from the topo")
+    values = []
+    for prompt, default, low in zip(prompts, last, (1, 1, 0, 1)):
+        v = rs.GetInteger(prompt, default, low)
+        if v is None:
+            return None
+        values.append(v)
+    void = rs.GetReal("Ground engagement: share of pod nodes left as voids (0 = solid)", last[4], 0.0, 1.0)
+    if void is None:
+        return None
+    values.append(void)
+    sc.sticky["ground_engagement"] = tuple(values)
+    return tuple(values)
+
+def ask_pathway_engagement():
+    #Pod settings, starting from the last values used this Rhino session.
+    #Returns (width, spill, floors, void), or None if cancelled.
+    defaults = (pe_width, pe_spill, pe_floors, pe_void)
+    last = sc.sticky.get("pathway_engagement_pod", defaults)
+    if len(last) != len(defaults):
+        last = defaults
+    prompts = ("Pathway engagement: growth along the road on each side of the crossing (nodes)",
+               "Pathway engagement: spill past each road edge (nodes)",
+               "Pathway engagement: public floors from the topo")
+    values = []
+    for prompt, default, low in zip(prompts, last, (1, 0, 1)):
+        v = rs.GetInteger(prompt, default, low)
+        if v is None:
+            return None
+        values.append(v)
+    void = rs.GetReal("Pathway engagement: share of pod nodes left as voids (0 = solid)", last[3], 0.0, 1.0)
+    if void is None:
+        return None
+    values.append(void)
+    sc.sticky["pathway_engagement_pod"] = tuple(values)
+    return tuple(values)
+
 def main():
     road = pick_road()
     if road is None:
@@ -984,12 +1316,42 @@ def main():
     shared_weight = ask_shared_weight(shared_space_weight)
     if shared_weight is None:
         return
+    conditions = ask_conditions()
+    if conditions is None:
+        return
+    ge = None
+    if conditions["ground_engagement"]:
+        ge = ask_ground_engagement()
+        if ge is None:
+            return
+    pe = None
+    if conditions["pathway_engagement"]:
+        if obstacles.Faces.Count == 0:
+            print("Pathway engagement needs obstacles (the crossing roads or paths); skipped")
+        else:
+            pe = ask_pathway_engagement()
+            if pe is None:
+                return
 
     # ----- generate (internal only, nothing drawn yet)
-    grid = build_grid(road, topo, dist, fh, obstacles, clearance)
+    margin = max(ge[2] if ge else 0, pe[1] if pe else 0)
+    grid = build_grid(road, topo, dist, fh, obstacles, clearance, margin)
     if grid is None:
         return
     cores = place_vertcirc(grid, spacing)
+    public, voids, crossings = [], {}, 0
+    if ge:
+        g_spacing, g_length, g_spill, g_floors, g_void = ge
+        blocks, voids["Ground engagement"] = place_ground_engagement(
+            grid, g_spacing, g_length, g_spill, g_floors, void=g_void)
+        public += blocks
+    if pe:
+        p_width, p_spill, p_floors, p_void = pe
+        blocks, crossings, voids["Pathway engagement"] = place_pathway_engagement(
+            grid, p_width, p_spill, p_floors, void=p_void)
+        public += blocks
+        if crossings == 0:
+            print("Pathway engagement: no obstacle crosses under the road, nothing added")
     core_shared = place_core_shared(grid, cores)
     apartments, scattered, filler = [], [], []
     for k in range(grid.shape[2]):
@@ -1001,8 +1363,8 @@ def main():
         apt.number = n
 
     # ----- draw everything at the end
-    draw(grid, cores, core_shared, apartments, scattered, filler)
-    print(summary(grid, cores, core_shared, apartments, scattered, filler))
+    draw(grid, cores, core_shared, apartments, scattered, filler, public)
+    print(summary(grid, cores, core_shared, apartments, scattered, filler, public, voids, crossings))
 
 if __name__ == "__main__":
     main()
