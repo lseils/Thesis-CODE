@@ -219,6 +219,9 @@ class Grid:
         # per column (inf = no obstacle below), and the floor height
         self.obstacle_hit: np.ndarray | None = None
         self.floor_height: float | None = None
+        # filled in by build_grid: centerline length and node distance, in model units
+        self.road_length: float | None = None
+        self.node_distance: float | None = None
 
     def ground_k(self, i: int, j: int) -> int | None:
         #k of the cell standing on the topo in column (i, j), or None
@@ -1286,9 +1289,351 @@ def build_grid(road, topo, node_distance: float, floor_height: float,
         print("No room for a single floor between the road and the topo")
         return None
     grid.floor_height = floor_height
+    grid.road_length, grid.node_distance = length, node_distance
     grid.obstacle_hit = (obstacle_depth + clearance if obstacle_depth is not None
                          else np.full(grid.shape[:2], np.inf))
     return grid
+
+#=================================================
+#----------------------------------------- EVALUATE
+# Scores a finished generation, measured on the node grid. A "wall" is one side face of an
+# apartment's room cell (one node wide, one floor tall). Results print after the summary and
+# are saved to two CSV files next to the Rhino file (one row per run, one row per apartment).
+
+view_distance_ft = 20.0   # "can see" a shared space up to this far, across shared space or open air
+egress_limit_ft = 250.0   # walking distance to a core that reaches the topo; longer is flagged
+
+ROOM_STATES = (ProgramState.LIVING, ProgramState.BEDROOM, ProgramState.KITCHEN, ProgramState.BATHROOM)
+WALL_SIDES = ((1, 0), (-1, 0), (0, 1), (0, -1))
+LIGHT_KINDS = ("direct_outside", "direct_shared", "perp_outside", "perp_shared")
+
+# Scoring weights (adjustable in the "Scoring weights" window, remembered for the session)
+DEFAULT_WEIGHTS = {
+    # overall score: how much each aspect counts
+    "w_light": 1.0, "w_community": 1.0, "w_privacy": 1.0, "w_density": 1.0, "w_walking": 1.0,
+    # light / air: how much one wall of each kind counts
+    "direct_outside": 1.0, "direct_shared": 0.75, "perp_outside": 0.5, "perp_shared": 0.25,
+    # privacy gradient: how much a room facing public space counts
+    "bedroom": 2.0, "bathroom": 2.0, "living": 1.0, "kitchen": 1.0,
+}
+
+def open_air(grid: Grid, i: int, j: int, k: int) -> bool:
+    #Off the grid or open air (past the road edge, a void, an obstacle's clearance)
+    return not grid.in_bounds(i, j, k) or grid.states[i, j, k] == ProgramState.OUTSIDE
+
+def wall_length(grid: Grid, i: int, j: int, di: int, dj: int) -> float:
+    #Plan length of the wall of cell (i, j) on side (di, dj), in model units
+    c = grid.corners[:, :, 0]
+    if di == 1:
+        p, q = c[i + 1, j], c[i + 1, j + 1]
+    elif di == -1:
+        p, q = c[i, j], c[i, j + 1]
+    elif dj == 1:
+        p, q = c[i, j + 1], c[i + 1, j + 1]
+    else:
+        p, q = c[i, j], c[i + 1, j]
+    return float(np.linalg.norm(q[:2] - p[:2]))
+
+def cell_areas(grid: Grid) -> np.ndarray:
+    #(n_div, n_off) plan area of each column's cell, in model units squared
+    c = grid.corners[:, :, 0, :2]
+    a, b, cc, d = c[:-1, :-1], c[1:, :-1], c[1:, 1:], c[:-1, 1:]
+    def tri(p, q, r):
+        return 0.5 * np.abs((q[..., 0] - p[..., 0]) * (r[..., 1] - p[..., 1])
+                            - (q[..., 1] - p[..., 1]) * (r[..., 0] - p[..., 0]))
+    return tri(a, b, cc) + tri(a, cc, d)
+
+def wall_light(grid: Grid, i: int, j: int, k: int, di: int, dj: int) -> str | None:
+    #What one wall gets: "direct_outside", "direct_shared", "perp_outside", "perp_shared" or None.
+    #outside / shared = what is right against the wall. direct = looking straight out, the view
+    #stays open (open air or shared space) all the way past the building; perpendicular = it is
+    #closed off further out (another room, a core...), so the light comes in from the side.
+    a, b = i + di, j + dj
+    if open_air(grid, a, b, k):
+        kind = "outside"
+    elif grid.states[a, b, k] == ProgramState.SHARED:
+        kind = "shared"
+    else:
+        return None
+    while grid.in_bounds(a, b, k):
+        if grid.states[a, b, k] not in (ProgramState.OUTSIDE, ProgramState.SHARED):
+            return "perp_" + kind
+        a, b = a + di, b + dj
+    return "direct_" + kind
+
+def wall_view(grid: Grid, i: int, j: int, k: int, di: int, dj: int, steps: int) -> list[Node]:
+    #Shared cells seen straight out from a wall, across shared space and open air, within `steps` cells
+    seen = []
+    a, b = i + di, j + dj
+    for _ in range(steps):
+        if not grid.in_bounds(a, b, k):
+            break
+        s = grid.states[a, b, k]
+        if s == ProgramState.SHARED:
+            seen.append(Node(a, b, k))
+        elif s != ProgramState.OUTSIDE:
+            break
+        a, b = a + di, b + dj
+    return seen
+
+def wall_public(grid: Grid, i: int, j: int, k: int, di: int, dj: int, steps: int) -> str | None:
+    #"direct" if public space is right against the wall, "buffered" if shared space sits between
+    #the wall and public space (within `steps` cells), otherwise None
+    a, b = i + di, j + dj
+    for step in range(steps):
+        if not grid.in_bounds(a, b, k):
+            return None
+        s = grid.states[a, b, k]
+        if s == ProgramState.PUBLIC:
+            return "direct" if step == 0 else "buffered"
+        if s != ProgramState.SHARED:
+            return None
+        a, b = a + di, b + dj
+    return None
+
+def shared_regions(grid: Grid) -> dict[Node, int]:
+    #Each shared cell -> id of its shared space (shared cells touching side by side on one floor)
+    region, next_id = {}, 0
+    for start in map(lambda c: Node(*map(int, c)), np.argwhere(grid.states == ProgramState.SHARED)):
+        if start in region:
+            continue
+        stack = [start]
+        region[start] = next_id
+        while stack:
+            n = stack.pop()
+            for di, dj in WALL_SIDES:
+                m = Node(n.i + di, n.j + dj, n.k)
+                if grid.in_bounds(*m) and m not in region and grid.states[m] == ProgramState.SHARED:
+                    region[m] = next_id
+                    stack.append(m)
+        next_id += 1
+    return region
+
+def egress_distances(grid: Grid, cores: Sequence[Program]) -> tuple[dict[Node, float], int]:
+    #Walking distance (model units) from every shared / public cell to the nearest core that
+    #reaches the topo, walking cell to cell on one floor. Returns ({cell: distance}, grounded cores).
+    import heapq
+    pos = grid.positions
+    dist, heap, grounded = {}, [], 0
+    for core in cores:
+        w, d, dk = core.footprint(core.rotated)
+        if not core_grounded(grid, core.origin.i, core.origin.j, w, d, dk):
+            continue
+        grounded += 1
+        for n in core.nodes:
+            dist[n] = 0.0
+            heapq.heappush(heap, (0.0, n))
+    walkable = (ProgramState.SHARED, ProgramState.PUBLIC)
+    while heap:
+        dn, n = heapq.heappop(heap)
+        if dn > dist.get(n, math.inf):
+            continue
+        for di, dj in WALL_SIDES:
+            m = Node(n.i + di, n.j + dj, n.k)
+            if not grid.in_bounds(*m) or grid.states[m] not in walkable:
+                continue
+            dm = dn + float(np.linalg.norm(pos[m] - pos[n]))
+            if dm < dist.get(m, math.inf):
+                dist[m] = dm
+                heapq.heappush(heap, (dm, m))
+    return dist, grounded
+
+def densification_potential(grid: Grid, scattered: Sequence[Program], filler: Sequence[Program]) -> int:
+    #How many more apartments fit into the current shared and leftover space without moving
+    #anything: a trial copy of the grid frees the shared space placed between apartments and as
+    #leftover fill (core landings and living room openings stay) and fills it with apartments.
+    trial = copy.deepcopy(grid)
+    for p in list(scattered) + list(filler):
+        for n in p.nodes:
+            trial.states[n] = ProgramState.EMPTY
+    added = 0
+    for k in range(trial.shape[2]):
+        placed, _, _ = populate(trial, floor=k, shared_weight=0.0, fill_shared=False)
+        added += len(placed)
+    return added
+
+def evaluate(grid: Grid, cores: Sequence[Program], apartments: Sequence[Apartment],
+             scattered: Sequence[Program], filler: Sequence[Program], ft: float,
+             weights: dict | None = None) -> dict:
+    #Scores one generation. ft = model units per foot. Returns {"summary": {...}, "apartments": [...]}
+    w = dict(DEFAULT_WEIGHTS)
+    w.update(weights or {})
+    nd = grid.node_distance or float(np.linalg.norm(grid.positions[1, 0, 0] - grid.positions[0, 0, 0]))
+    fh = grid.floor_height or nd
+    sqft = ft * ft
+    steps = 1 + int(math.floor(view_distance_ft * ft / nd + 1e-9))
+    room_weight = {ProgramState.BEDROOM: w["bedroom"], ProgramState.BATHROOM: w["bathroom"],
+                   ProgramState.LIVING: w["living"], ProgramState.KITCHEN: w["kitchen"]}
+    owner = {n: a for a, apt in enumerate(apartments) for p in apt.programs for n in p.nodes}
+    regions = shared_regions(grid)
+    egress, grounded_cores = egress_distances(grid, cores)
+    pos = grid.positions
+    viewers = {}                              # shared space id -> apartments that see it
+    rows = []
+    for a, apt in enumerate(apartments):
+        light = {kind: 0 for kind in LIGHT_KINDS}
+        light_sqft = {kind: 0.0 for kind in LIGHT_KINDS}
+        walls = 0
+        connected = False
+        seen = set()
+        public_direct = public_buffered = 0
+        privacy_direct_w = privacy_buffered_w = 0.0
+        walk = math.inf
+        for p in apt.programs:
+            for n in p.nodes:
+                for di, dj in WALL_SIDES:
+                    m = Node(n.i + di, n.j + dj, n.k)
+                    if owner.get(m) == a:
+                        continue                  # inside the apartment
+                    walls += 1
+                    kind = wall_light(grid, n.i, n.j, n.k, di, dj)
+                    if kind:
+                        light[kind] += 1
+                        light_sqft[kind] += wall_length(grid, n.i, n.j, di, dj) * fh / sqft
+                    if grid.in_bounds(*m) and grid.states[m] == ProgramState.SHARED:
+                        connected = True
+                    seen.update(regions[c] for c in wall_view(grid, n.i, n.j, n.k, di, dj, steps))
+                    exposure = wall_public(grid, n.i, n.j, n.k, di, dj, steps)
+                    if exposure == "direct":
+                        public_direct += 1
+                        privacy_direct_w += room_weight[p.type]
+                    elif exposure == "buffered":
+                        public_buffered += 1
+                        privacy_buffered_w += room_weight[p.type]
+                    if grid.in_bounds(*m) and m in egress:
+                        walk = min(walk, egress[m] + float(np.linalg.norm(pos[m] - pos[n])))
+        for r in seen:
+            viewers.setdefault(r, set()).add(a)
+        lit = sum(w[kind] * light[kind] for kind in LIGHT_KINDS)
+        rows.append({
+            "apartment": apt.number, "type": apt.type, "floor": apt.floor,
+            **{f"walls_{kind}": light[kind] for kind in LIGHT_KINDS},
+            **{f"sqft_{kind}": round(light_sqft[kind], 1) for kind in LIGHT_KINDS},
+            "light_score": round(lit / walls, 3) if walls else 0.0,
+            "connected_to_shared": connected, "sees_shared": bool(seen),
+            "public_walls_direct": public_direct, "public_walls_buffered": public_buffered,
+            "privacy_direct_weighted": privacy_direct_w, "privacy_buffered_weighted": privacy_buffered_w,
+            "walk_to_egress_ft": round(walk / ft, 1) if math.isfinite(walk) else None,
+            "over_egress_limit": (not math.isfinite(walk)) or walk / ft > egress_limit_ft,
+        })
+
+    n_apts = len(rows)
+    areas = cell_areas(grid)
+    def area_of(states):
+        mask = np.isin(grid.states, states)
+        return float((areas[:, :, None] * mask).sum()) / sqft
+    buildable = int(np.count_nonzero(~np.isin(grid.states, (ProgramState.OUTSIDE, ProgramState.GROUND))))
+    apt_nodes = sum(len(p.nodes) for apt in apartments for p in apt.programs)
+    road_ft = (grid.road_length or grid.shape[0] * nd) / ft
+    per_floor = [sum(1 for r in rows if r["floor"] == k) for k in range(grid.shape[2])]
+    region_views = [len(viewers.get(r, ())) for r in set(regions.values())]
+    walks = [r["walk_to_egress_ft"] for r in rows if r["walk_to_egress_ft"] is not None]
+    direct_w = sum(r["privacy_direct_weighted"] for r in rows)
+    buffered_w = sum(r["privacy_buffered_weighted"] for r in rows)
+
+    scores = {
+        "light": float(np.mean([r["light_score"] for r in rows])) if rows else 0.0,
+        "community": (0.5 * sum(r["connected_to_shared"] for r in rows) / n_apts
+                      + 0.5 * sum(r["sees_shared"] for r in rows) / n_apts) if n_apts else 0.0,
+        "privacy": buffered_w / (buffered_w + direct_w) if (buffered_w + direct_w) else 1.0,
+        "density": apt_nodes / buildable if buildable else 0.0,
+        "walking": sum(1 for r in rows if not r["over_egress_limit"]) / n_apts if n_apts else 0.0,
+    }
+    total_w = sum(w["w_" + k] for k in scores)
+    overall = sum(w["w_" + k] * v for k, v in scores.items()) / total_w if total_w else 0.0
+
+    summary = {
+        "apartments": n_apts,
+        "apartments_per_floor": per_floor,
+        "apartments_per_100ft": round(n_apts / (road_ft / 100.0), 2) if road_ft else 0.0,
+        "road_length_ft": round(road_ft, 1),
+        "sqft_apartments": round(area_of(ROOM_STATES), 0),
+        "sqft_shared": round(area_of((ProgramState.SHARED,)), 0),
+        "sqft_public": round(area_of((ProgramState.PUBLIC,)), 0),
+        "sqft_cores": round(area_of((ProgramState.VERTCIRC,)), 0),
+        "densification_potential": densification_potential(grid, scattered, filler),
+        **{f"walls_{kind}": sum(r[f"walls_{kind}"] for r in rows) for kind in LIGHT_KINDS},
+        **{f"sqft_{kind}": round(sum(r[f"sqft_{kind}"] for r in rows), 0) for kind in LIGHT_KINDS},
+        "apartments_connected_to_shared": sum(r["connected_to_shared"] for r in rows),
+        "apartments_seeing_shared": sum(r["sees_shared"] for r in rows),
+        "shared_spaces": len(region_views),
+        "shared_space_viewers_avg": round(float(np.mean(region_views)), 2) if region_views else 0.0,
+        "shared_space_viewers_max": max(region_views) if region_views else 0,
+        "shared_spaces_unseen": sum(1 for v in region_views if v == 0),
+        "public_walls_direct": sum(r["public_walls_direct"] for r in rows),
+        "public_walls_buffered": sum(r["public_walls_buffered"] for r in rows),
+        "grounded_cores": grounded_cores,
+        "walk_avg_ft": round(float(np.mean(walks)), 1) if walks else None,
+        "walk_max_ft": round(max(walks), 1) if walks else None,
+        "apartments_over_egress_limit": sum(r["over_egress_limit"] for r in rows),
+        "apartments_without_egress": sum(1 for r in rows if r["walk_to_egress_ft"] is None),
+        **{f"score_{k}": round(v, 3) for k, v in scores.items()},
+        "score_overall": round(overall, 3),
+    }
+    return {"summary": summary, "apartments": rows}
+
+def format_evaluation(result: dict) -> str:
+    s = result["summary"]
+    lines = ["Evaluation",
+             f"  Density: {s['apartments']} apartments, {s['apartments_per_100ft']} per 100 ft of road "
+             f"({s['road_length_ft']} ft); per floor {s['apartments_per_floor']}",
+             f"    area (sq ft): apartments {s['sqft_apartments']:.0f}, shared {s['sqft_shared']:.0f}, "
+             f"public {s['sqft_public']:.0f}, cores {s['sqft_cores']:.0f}",
+             f"    densification potential: {s['densification_potential']} more apartments fit "
+             f"in today's shared / leftover space",
+             "  Light / air (walls, sq ft):"]
+    names = {"direct_outside": "direct to outside", "direct_shared": "direct to shared",
+             "perp_outside": "perpendicular to outside", "perp_shared": "perpendicular to shared"}
+    for kind in LIGHT_KINDS:
+        lines.append(f"    {names[kind]:<26} {s['walls_' + kind]:5d}  {s['sqft_' + kind]:8.0f}")
+    lines += [
+        f"  Community: {s['apartments_connected_to_shared']} apartments connected to shared space, "
+        f"{s['apartments_seeing_shared']} can see one (within {view_distance_ft:.0f} ft)",
+        f"    {s['shared_spaces']} shared spaces, seen by {s['shared_space_viewers_avg']} apartments "
+        f"on average (most {s['shared_space_viewers_max']}, {s['shared_spaces_unseen']} unseen)",
+        f"    privacy gradient: {s['public_walls_direct']} walls face public directly, "
+        f"{s['public_walls_buffered']} with shared space in between",
+        f"  Walking to egress ({s['grounded_cores']} cores reach the topo): "
+        f"average {s['walk_avg_ft']} ft, longest {s['walk_max_ft']} ft",
+        f"    {s['apartments_over_egress_limit']} apartments over {egress_limit_ft:.0f} ft "
+        f"({s['apartments_without_egress']} with no route to a core)",
+        f"  Scores (0-1): light {s['score_light']}, community {s['score_community']}, "
+        f"privacy {s['score_privacy']}, density {s['score_density']}, walking {s['score_walking']}"
+        f"  ->  overall {s['score_overall']}",
+    ]
+    return "\n".join(lines)
+
+def save_evaluation(result: dict, settings: dict) -> str | None:
+    #Append this run to <file>_evaluation_runs.csv and its apartments to
+    #<file>_evaluation_apartments.csv, next to the Rhino file (Documents if it isn't saved).
+    #Returns the folder, or None if the files couldn't be written.
+    import csv, os, datetime
+    folder = os.path.dirname(sc.doc.Path) if sc.doc.Path else os.path.join(os.path.expanduser("~"), "Documents")
+    name = os.path.splitext(sc.doc.Name)[0] if sc.doc.Name else "untitled"
+    run = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def append(path, rows):
+        if not rows:
+            return
+        fields = list(rows[0].keys())
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            if new:
+                writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {"run": run, **{f"set_{k}": v for k, v in settings.items()}}
+    summary.update({k: (" ".join(map(str, v)) if isinstance(v, list) else v)
+                    for k, v in result["summary"].items()})
+    try:
+        append(os.path.join(folder, f"{name}_evaluation_runs.csv"), [summary])
+        append(os.path.join(folder, f"{name}_evaluation_apartments.csv"),
+               [{"run": run, **r} for r in result["apartments"]])
+    except OSError as e:
+        print(f"Evaluation: couldn't write the CSV files ({e})")
+        return None
+    return folder
 
 #=================================================
 #--------------------------------------------- DRAW
@@ -1484,6 +1829,100 @@ def pod_section_fields(last: dict, first: list[dict]) -> list[dict]:
              hint="Share of the pod's nodes randomly left open (0 = solid)"),
     ]
 
+def ask_weights(owner=None) -> dict | None:
+    #The "Scoring weights" window: how much each aspect counts in the overall score, how much each
+    #kind of lit wall counts, and how much each room type counts for privacy.
+    #Saves to the session (sc.sticky) and returns the weights, or None if cancelled.
+    last = remembered("evaluation_weights", DEFAULT_WEIGHTS)
+    overall_fields = [
+        dict(key="w_light", label="Light / air", value=last["w_light"], kind="float", low=0, high=5,
+             step=0.25, hint="How much light / air counts in the overall score"),
+        dict(key="w_community", label="Community", value=last["w_community"], kind="float", low=0, high=5,
+             step=0.25, hint="Apartments connected to and able to see shared space"),
+        dict(key="w_privacy", label="Privacy gradient", value=last["w_privacy"], kind="float", low=0, high=5,
+             step=0.25, hint="Public space reached through shared space rather than directly"),
+        dict(key="w_density", label="Density", value=last["w_density"], kind="float", low=0, high=5,
+             step=0.25, hint="Share of the buildable nodes that are apartments"),
+        dict(key="w_walking", label="Walking to egress", value=last["w_walking"], kind="float", low=0, high=5,
+             step=0.25, hint=f"Share of apartments within {egress_limit_ft:.0f} ft of a core that reaches the topo"),
+    ]
+    light_fields = [
+        dict(key="direct_outside", label="Direct to outside", value=last["direct_outside"], kind="float",
+             low=0, high=1, hint="A wall facing straight out to open air"),
+        dict(key="direct_shared", label="Direct to shared", value=last["direct_shared"], kind="float",
+             low=0, high=1, hint="A wall facing shared space, with the view open beyond it"),
+        dict(key="perp_outside", label="Perpendicular to outside", value=last["perp_outside"], kind="float",
+             low=0, high=1, hint="A wall facing open air that is closed off further out (light from the side)"),
+        dict(key="perp_shared", label="Perpendicular to shared", value=last["perp_shared"], kind="float",
+             low=0, high=1, hint="A wall facing shared space that is closed off further out"),
+    ]
+    room_fields = [
+        dict(key="bedroom", label="Bedroom", value=last["bedroom"], kind="float", low=0, high=5, step=0.25,
+             hint="How much a bedroom facing public space counts"),
+        dict(key="bathroom", label="Bathroom", value=last["bathroom"], kind="float", low=0, high=5, step=0.25,
+             hint="How much a bathroom facing public space counts"),
+        dict(key="living", label="Living", value=last["living"], kind="float", low=0, high=5, step=0.25,
+             hint="How much a living room facing public space counts"),
+        dict(key="kitchen", label="Kitchen", value=last["kitchen"], kind="float", low=0, high=5, step=0.25,
+             hint="How much a kitchen facing public space counts"),
+    ]
+    overall_box, overall_boxes, _ = settings_section(
+        "Overall score", "How much each aspect counts (0 = ignore it).", overall_fields)
+    light_box, light_boxes, _ = settings_section(
+        "Light / air", "How much one wall of each kind counts.", light_fields)
+    room_box, room_boxes, _ = settings_section(
+        "Privacy gradient", "How much each room facing public space counts.", room_fields)
+
+    dialog = forms.Dialog()
+    dialog.Title = "Scoring weights"
+    dialog.Padding = drawing.Padding(14)
+    dialog.Resizable = False
+    result = {"ok": False}
+    ok, cancel, reset = forms.Button(), forms.Button(), forms.Button()
+    ok.Text, cancel.Text, reset.Text = "OK", "Cancel", "Reset to defaults"
+
+    def on_ok(sender, e):
+        result["ok"] = True
+        dialog.Close()
+
+    def on_cancel(sender, e):
+        dialog.Close()
+
+    def on_reset(sender, e):
+        for boxes in (overall_boxes, light_boxes, room_boxes):
+            for key, box in boxes.items():
+                box.Value = float(DEFAULT_WEIGHTS[key])
+
+    ok.Click += on_ok
+    cancel.Click += on_cancel
+    reset.Click += on_reset
+    dialog.DefaultButton, dialog.AbortButton = ok, cancel
+
+    left, right = forms.StackLayout(), forms.StackLayout()
+    for column, boxes in ((left, (overall_box,)), (right, (light_box, room_box))):
+        column.Spacing = 10
+        column.HorizontalContentAlignment = forms.HorizontalAlignment.Stretch
+        for b in boxes:
+            column.Items.Add(forms.StackLayoutItem(b))
+    buttons = forms.TableLayout()
+    buttons.Spacing = drawing.Size(8, 0)
+    buttons.Rows.Add(forms.TableRow(forms.TableCell(None, True), forms.TableCell(cancel), forms.TableCell(ok)))
+    reset_row = forms.TableLayout()
+    reset_row.Rows.Add(forms.TableRow(forms.TableCell(reset), forms.TableCell(None, True)))
+    page = forms.TableLayout()
+    page.Spacing = drawing.Size(12, 12)
+    page.Rows.Add(forms.TableRow(forms.TableCell(left, True), forms.TableCell(right, True)))
+    page.Rows.Add(forms.TableRow(forms.TableCell(reset_row), forms.TableCell(buttons)))
+    dialog.Content = page
+    dialog.ShowModal(owner or Rhino.UI.RhinoEtoApp.MainWindow)
+    if not result["ok"]:
+        return None
+    values = dict(last)
+    for fields, boxes in ((overall_fields, overall_boxes), (light_fields, light_boxes), (room_fields, room_boxes)):
+        values.update(read_numbers(fields, boxes))
+    sc.sticky["evaluation_weights"] = values
+    return values
+
 def ask_settings(has_obstacles: bool) -> dict | None:
     #Every setting in one window. Returns
     #  {"grid": {...}, "conditions": {key: bool}, "ground_engagement": {...},
@@ -1557,8 +1996,14 @@ def ask_settings(has_obstacles: bool) -> dict | None:
     dialog.Padding = drawing.Padding(14)
     dialog.Resizable = False
     result = {"ok": False}
-    generate, cancel = forms.Button(), forms.Button()
-    generate.Text, cancel.Text = "Generate", "Cancel"
+    generate, cancel, weights = forms.Button(), forms.Button(), forms.Button()
+    generate.Text, cancel.Text, weights.Text = "Generate", "Cancel", "Scoring weights..."
+    weights.ToolTip = "How the evaluation scores each aspect"
+
+    def on_weights(sender, e):
+        ask_weights(dialog)
+
+    weights.Click += on_weights
 
     def on_generate(sender, e):
         result["ok"] = True
@@ -1584,7 +2029,9 @@ def ask_settings(has_obstacles: bool) -> dict | None:
     page = forms.TableLayout()
     page.Spacing = drawing.Size(12, 12)
     page.Rows.Add(forms.TableRow(forms.TableCell(left, True), forms.TableCell(right, True)))
-    page.Rows.Add(forms.TableRow(forms.TableCell(None), forms.TableCell(buttons)))
+    weights_row = forms.TableLayout()
+    weights_row.Rows.Add(forms.TableRow(forms.TableCell(weights), forms.TableCell(None, True)))
+    page.Rows.Add(forms.TableRow(forms.TableCell(weights_row), forms.TableCell(buttons)))
     dialog.Content = page
     dialog.ShowModal(Rhino.UI.RhinoEtoApp.MainWindow)
     if not result["ok"]:
@@ -1673,6 +2120,20 @@ def main():
     # ----- draw everything at the end
     draw(grid, cores, core_shared, apartments, scattered, filler, public)
     print(summary(grid, cores, core_shared, apartments, scattered, filler, public, voids, crossings))
+
+    # ----- evaluate, print and save to CSV
+    ft = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Feet, sc.doc.ModelUnitSystem)
+    result = evaluate(grid, cores, apartments, scattered, filler, ft,
+                      remembered("evaluation_weights", DEFAULT_WEIGHTS))
+    print(format_evaluation(result))
+    run_settings = dict(grid_set)
+    run_settings.update({k: v for k, v in conditions.items()})
+    for key, values in (("ground_engagement", g), ("pathway_engagement", p_), ("ends_ramp_down", e)):
+        if conditions[key]:
+            run_settings.update({f"{key}_{k}": v for k, v in values.items()})
+    folder = save_evaluation(result, run_settings)
+    if folder:
+        print(f"Evaluation saved to {folder}")
 
 if __name__ == "__main__":
     main()
