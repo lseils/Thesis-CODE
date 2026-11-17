@@ -9,6 +9,9 @@ import rhinoscriptsyntax as rs #slower than rg
 import math
 import random
 import System.Drawing
+import Rhino.UI
+import Eto.Forms as forms
+import Eto.Drawing as drawing
 from System.Collections.Generic import List
 from enum import IntEnum
 from typing import NamedTuple, Iterator, Sequence
@@ -45,7 +48,8 @@ apartment_weights = {
 shared_space_weight = 1   # the only weight asked at run time; apartment weights are set here only
 
 # Vertical circulation: one 1x3 core every this many nodes along the road (asked at run time).
-# Cores are placed before any apartment and run from the top floor down to the topo.
+# Cores are placed before everything else (shared space, conditions, apartments) and run from
+# the top floor down to the topo. A core that doesn't fit slides along the road to the nearest spot.
 vertcirc_spacing = 20
 # On every floor, at least this share of the buildable cells touching a core become shared space.
 core_shared_share = 0.5
@@ -54,6 +58,14 @@ core_shared_share = 0.5
 # clearance above them, but the space between the clearance and the main road is still buildable.
 obstacle_clearance_ft = 16.0   # in feet, converted to model units (asked at run time)
 obstacle_samples = 5           # rays per cell side when looking for obstacles (5 = 25 rays per column)
+
+# Cell checks. Rows of cells point straight across the road at each step along it, so on a curve
+# the cells fan out and the building bends with the road. A column of cells is only used if:
+road_coverage = 0.75   # at least this share of it sits on the road surface (asked at run time);
+                       # an end cut at an angle becomes a staircase of whole cells
+coverage_samples = 4   # sample points per cell side for the coverage check (4 = 16 per column)
+max_cell_skew = 45.0   # no corner more than this many degrees off a right angle
+min_cell_area = 0.6    # and at least this share of a full node_distance x node_distance cell
 
 # ---- Conditions (only used when "Conditions" is picked at run time)
 # Ground engagement: Public pods at an interval along the road. Each pod stands on the topo,
@@ -77,6 +89,16 @@ pe_width = 5         # pod growth along the road on each side of the crossing, g
 pe_spill = 4         # nodes the pod reaches past each road edge on the ground floor (asked at run time)
 pe_floors = 2        # floors of public, counted up from the topo (asked at run time)
 pe_void = 0.08       # share of each pod's nodes randomly left as voids (asked at run time)
+
+# Ends / ramp down: each short end is treated as if another road crossed right past it, so it
+# gets half of a pathway engagement pod: the pod is centered on the end, and only the half inside
+# the generation is built. The floors above the pod are left as they are (nothing is voided).
+# The end is the first / last node along the road whose column reaches the topo
+# (a crossing road right at the end is skipped).
+er_width = 5         # pod growth inward from the end on the ground floor, in nodes, like pe_width (asked)
+er_spill = 4         # nodes the end pod reaches past each road edge on the ground floor (asked)
+er_floors = 2        # floors of public in the end pod, counted up from the topo (asked)
+er_void = 0.08       # share of each end pod's nodes randomly left as voids (asked)
 
 #also ask user to select bridge and topo layer
 
@@ -578,11 +600,29 @@ APARTMENT_TYPES = [
 ]
 
 #______________________________
+def core_depth(grid: Grid, i: int, j: int, w: int, d: int) -> int:
+    #How many floors a w x d core at (i, j) can run down from the top floor (0 = doesn't fit)
+    dk = 0
+    while dk < grid.shape[2] and grid.box_fits(i, j, 0, w, d, dk + 1):
+        dk += 1
+    return dk
+
+def core_grounded(grid: Grid, i: int, j: int, w: int, d: int, dk: int) -> bool:
+    #True if a core dk floors deep at (i, j) reaches the topo (not cut short by an obstacle)
+    if dk == 0 or grid.levels is None:
+        return dk > 0
+    lowest = min(int(grid.levels[a, b]) for a in range(i, i + w) for b in range(j, j + d))
+    return dk >= lowest
+
 def place_vertcirc(grid: Grid, spacing: int = vertcirc_spacing) -> list[Program]:
-    #Runs before any apartment. One 1x3 core every `spacing` nodes along the road,
+    #Runs first, before shared space, the engagement conditions and apartments: circulation
+    #comes before everything else. One 1x3 core every `spacing` nodes along the road,
     #its 3-node length across the road, centered on the centerline.
     #The series is centered along the road so both ends have the same leftover gap.
     #Each core runs from the top floor (k=0) down as far as all 3 of its columns are buildable.
+    #If a core's spot doesn't work (a crossing road's clearance, a stepped end...), it slides
+    #along the road to the nearest spot within half the spacing where it fits, preferring one
+    #that reaches the topo. It is only dropped if nothing in that range fits.
     n_div, n_off, n_z = grid.shape
     w, d = LAYOUT_SIZE[ProgramLayout.OXH]
     if n_off < d:
@@ -590,14 +630,32 @@ def place_vertcirc(grid: Grid, spacing: int = vertcirc_spacing) -> list[Program]
         return []
     j = (n_off - d) // 2
     start = ((n_div - 1) % spacing) // 2
+    reach = spacing // 2
+    offsets = [0] + [o for s in range(1, reach + 1) for o in (s, -s)]   # nearest first
     cores = []
-    for i in range(start, n_div, spacing):
-        dk = 0
-        while dk < n_z and grid.box_fits(i, j, 0, w, d, dk + 1):
-            dk += 1
-        if dk == 0:
-            print(f"No room for vertical circulation at node {i} along the road")
+    for target in range(start, n_div, spacing):
+        best = None                       # (i, dk, grounded)
+        for off in offsets:
+            i = target + off
+            if not 0 <= i <= n_div - w:
+                continue
+            dk = core_depth(grid, i, j, w, d)
+            if dk == 0:
+                continue
+            grounded = core_grounded(grid, i, j, w, d, dk)
+            if grounded:
+                best = (i, dk, True)
+                break
+            if best is None or dk > best[1]:
+                best = (i, dk, False)
+        if best is None:
+            print(f"Vertical circulation: no room within {reach} nodes of node {target}, core dropped")
             continue
+        i, dk, grounded = best
+        if i != target:
+            print(f"Vertical circulation: core moved from node {target} to node {i} to fit")
+        if not grounded:
+            print(f"Vertical circulation: core at node {i} can't reach the topo ({dk} floors)")
         core = Program("VC", height=dk)
         core.try_place_at(grid, Node(i, j, 0))   # the box at the anchor fits, checked above
         cores.append(core)
@@ -717,7 +775,7 @@ def place_ground_engagement(grid: Grid, spacing: int = ge_spacing, length: int =
                             spill: int = ge_spill, floors: int = ge_floors,
                             taper: int = ge_taper, floor_step: int = ge_floor_step,
                             void: float = ge_void) -> tuple[list[Block], int]:
-    #Runs after place_vertcirc, before anything else. Builds the public pods, then leaves
+    #Runs after the cores and their shared landings, before anything else. Builds the public pods, then leaves
     #the floor touching the topo empty everywhere else.
     #Returns (public blocks, number of void nodes).
     #A pod on floor f (0 = the cell on the topo) is made of steps s:
@@ -801,6 +859,37 @@ def place_pathway_engagement(grid: Grid, width: int = pe_width, spill: int = pe_
             blocks += [Block(ProgramState.PUBLIC, *box, condition="Pathway engagement",
                              group=f"pathway engagement pod #{n}") for box in merge_cells(pod)]
     return blocks, len(crossings), voids
+
+def generation_ends(grid: Grid) -> tuple[int, int] | None:
+    #(first i, last i) along the road whose column under the road reaches the topo, or None
+    has_ground = grid.in_road & (grid.levels > 0) & (grid.open_levels >= grid.levels)
+    rows = np.flatnonzero(has_ground.any(axis=1))
+    if rows.size == 0:
+        return None
+    return int(rows[0]), int(rows[-1])
+
+def place_ends_ramp_down(grid: Grid, width: int = er_width, spill: int = er_spill,
+                         floors: int = er_floors, void: float = er_void,
+                         taper: int = ge_taper, floor_step: int = ge_floor_step) -> tuple[list[Block], int]:
+    #Runs after the other engagement conditions, before shared space and apartments.
+    #At each end: half of a pathway engagement pod, as if a road crossed right past the end
+    #(a pod 2 * width long centered on the end; the outer half falls off the grid).
+    #The floors above the pod are not touched.
+    #Returns (public blocks, number of void nodes).
+    ends = generation_ends(grid)
+    if ends is None:
+        return [], 0
+    first, last = ends
+    pods = [build_pod(grid, first - 0.5, 2 * width, spill, floors, taper, floor_step),
+            build_pod(grid, last + 0.5, 2 * width, spill, floors, taper, floor_step)]
+    voids = carve_voids(grid, pods, void)
+
+    blocks = []
+    for name, pod in zip(("start", "end"), pods):
+        if pod:
+            blocks += [Block(ProgramState.PUBLIC, *box, condition="Ends / ramp down",
+                             group=f"ends ramp down pod ({name})") for box in merge_cells(pod)]
+    return blocks, voids
 
 def fill_shared_space(grid: Grid, floor: int = 0) -> list[Program]:
     #Runs after all apartments on the floor are placed.
@@ -904,14 +993,14 @@ def summary(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program]
     lines.append(f"  {len(core_shared):4d}  1x1 cells around vertical circulation")
     lines.append(f"Vertical circulation: {len(cores)} cores")
     voids = voids or {}
-    for condition, unit in (("Ground engagement", "pods"), ("Pathway engagement", "pods")):
+    for condition in ("Ground engagement", "Pathway engagement", "Ends / ramp down"):
         blocks = [b for b in public if b.condition == condition]
         if not blocks and condition not in voids:
             continue
         groups = len({b.group for b in blocks})
         cells = sum(len(b.nodes) for b in blocks)
         extra = f"{crossings} crossings, " if condition == "Pathway engagement" else ""
-        lines.append(f"{condition}: {extra}{groups} public {unit}, {cells} public nodes"
+        lines.append(f"{condition}: {extra}{groups} public pods, {cells} public nodes"
                      f" in {len(blocks)} boxes, {voids.get(condition, 0)} void nodes")
 
     # density = share of buildable nodes that ended up as apartments
@@ -967,39 +1056,110 @@ def road_guides(road, iso_param=0.5):
         centerline = face.IsoCurve(1, face.Domain(0).ParameterAt(iso_param))
     return centerline, edge_a, edge_b
 
-def road_frame(centerline, edges, s):
-    #Point s along the centerline, plus (unit direction, distance) to each road edge
+def road_frame(centerline, edges, s, flat_edges=None):
+    #Point s along the centerline, plus (unit direction, distance) to each road edge.
+    #The directions point straight across the road (90 degrees to the centerline in plan), so rows
+    #of cells turn with the road on curves but never swing toward an edge's end at an angled cut.
+    #flat_edges: the edges projected flat onto the world XY plane (computed here if not given).
     s = min(max(s, 0.0), centerline.GetLength())
     ok, t = centerline.LengthParameter(s)
     p = centerline.PointAt(t)
+    tangent = centerline.TangentAt(t)
+    across = rg.Vector3d.CrossProduct(tangent, rg.Vector3d.ZAxis)
+    across.Unitize()
+    if flat_edges is None:
+        flat_edges = [rg.Curve.ProjectToPlane(e, rg.Plane.WorldXY) for e in edges]
+    p_flat = rg.Point3d(p.X, p.Y, 0.0)
+    tol = sc.doc.ModelAbsoluteTolerance
     sides = []
-    for edge in edges:
-        v = closest_point_on(edge, p) - p
-        width = v.Length
-        v.Unitize()
+    for edge, flat in zip(edges, flat_edges):
+        to_edge = closest_point_on(edge, p) - p
+        v = across if rg.Vector3d.Multiply(to_edge, across) >= 0 else rg.Vector3d(-across.X, -across.Y, -across.Z)
+        # distance straight across (in plan) to where the edge is
+        reach = to_edge.Length + flat.GetBoundingBox(True).Diagonal.Length
+        line = rg.LineCurve(p_flat, p_flat + v * reach)
+        hits = Intersection.CurveCurve(line, flat, tol, tol)
+        dists = [h.PointA.DistanceTo(p_flat) for h in hits] if hits else []
+        if dists:
+            width = min(dists)
+        else:
+            width = abs(rg.Vector3d.Multiply(to_edge, v))   # past the edge's end (angled cut)
         sides.append((v, width))
     return p, sides
 
+def cell_quality_ok(top: np.ndarray, node_distance: float, max_skew: float = max_cell_skew,
+                    min_area: float = min_cell_area) -> np.ndarray:
+    #(n_div, n_off) True where a column's top cell isn't skewed past `max_skew` degrees at any
+    #corner and has at least `min_area` of a full node_distance x node_distance cell
+    a, b, c, d = top[:-1, :-1], top[1:, :-1], top[1:, 1:], top[:-1, 1:]
+    quad = (a, b, c, d)
+    ok = np.ones(a.shape[:2], dtype=bool)
+    for n in range(4):
+        p, prev, nxt = quad[n], quad[n - 1], quad[(n + 1) % 4]
+        u, v = prev - p, nxt - p
+        norms = np.linalg.norm(u, axis=-1) * np.linalg.norm(v, axis=-1)
+        cos = np.sum(u * v, axis=-1) / np.where(norms > 0, norms, 1.0)
+        angle = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+        ok &= (norms > 0) & (np.abs(angle - 90.0) <= max_skew)
+    area = 0.5 * (np.linalg.norm(np.cross(b - a, d - a), axis=-1)
+                  + np.linalg.norm(np.cross(b - c, d - c), axis=-1))
+    ok &= area >= min_area * node_distance ** 2
+    return ok
+
+def road_coverage_ok(top: np.ndarray, candidates: np.ndarray, road_mesh, share: float,
+                     samples: int = coverage_samples) -> np.ndarray:
+    #(n_div, n_off) True where at least `share` of the column's top cell is over the road.
+    #Only columns in `candidates` are tested (the rest are False). Each cell is sampled on a
+    #samples x samples grid; a sample counts if a ray straight down from above hits the road.
+    n_div, n_off = top.shape[0] - 1, top.shape[1] - 1
+    out = np.zeros((n_div, n_off), dtype=bool)
+    lift = road_mesh.GetBoundingBox(True).Diagonal.Length + 1.0
+    down = rg.Vector3d(0, 0, -1)
+    s = (np.arange(samples) + 0.5) / samples          # sample at sub-cell centers
+    for b in range(n_div):
+        for c in range(n_off):
+            if not candidates[b, c]:
+                continue
+            p00, p10, p11, p01 = top[b, c], top[b + 1, c], top[b + 1, c + 1], top[b, c + 1]
+            on = 0
+            for u in s:
+                for v in s:
+                    x, y, z = (1 - u) * (1 - v) * p00 + u * (1 - v) * p10 + u * v * p11 + (1 - u) * v * p01
+                    ray = rg.Ray3d(rg.Point3d(float(x), float(y), float(z) + lift), down)
+                    if Intersection.MeshRay(road_mesh, ray) >= 0:
+                        on += 1
+            out[b, c] = on >= share * samples * samples - 1e-9
+    return out
+
 def grid_from_road_samples(top: np.ndarray, corner_ok: np.ndarray, depth: np.ndarray,
                            floor_height: float, tol: float = 0.0,
-                           obstacle_depth: np.ndarray | None = None) -> Grid | None:
+                           obstacle_depth: np.ndarray | None = None,
+                           column_ok: np.ndarray | None = None,
+                           on_road: np.ndarray | None = None) -> Grid | None:
     #top:       (n_div+1, n_off+1, 3) corner points on the road surface
     #corner_ok: (n_div+1, n_off+1) True where the corner is inside the road edges
     #depth:     (n_div+1, n_off+1) distance straight down to the topo (nan = no topo below)
     #obstacle_depth: optional (n_div, n_off) distance down to the clearance line above an
     #           obstacle, per column of cells (inf = no obstacle below)
+    #column_ok: optional (n_div, n_off) False for columns too skewed / small to use at all
+    #on_road:   optional (n_div, n_off) False for columns not enough on the road surface
     d = np.where(np.isfinite(depth), depth, -np.inf)
 
     # a column of cells is only as deep as its shallowest corner
     col = np.minimum.reduce([d[:-1, :-1], d[1:, :-1], d[1:, 1:], d[:-1, 1:]])
+    if column_ok is not None:
+        col[~column_ok] = -np.inf      # too skewed / small: no floors, under the road or past it
     levels = np.zeros(col.shape, dtype=int)
     finite = np.isfinite(col)
     levels[finite] = np.floor((col[finite] + tol) / floor_height).astype(int)
     levels = np.maximum(levels, 0)
 
-    # under the road = all 4 top corners inside the road edges, with topo below
+    # under the road = all 4 top corners inside the road edges, enough of it on the road
+    # surface, with topo below
     ok = corner_ok.astype(bool)
     in_road = ok[:-1, :-1] & ok[1:, :-1] & ok[1:, 1:] & ok[:-1, 1:] & finite
+    if on_road is not None:
+        in_road &= on_road
 
     # floors above an obstacle's clearance line (never deeper than the topo)
     open_levels = levels.copy()
@@ -1057,14 +1217,17 @@ def obstacle_clearance_depth(top: np.ndarray, sampled: np.ndarray, obstacles,
     return out
 
 def build_grid(road, topo, node_distance: float, floor_height: float,
-               obstacles=None, clearance: float = 0.0, margin: int = 0) -> Grid | None:
+               obstacles=None, clearance: float = 0.0, margin: int = 0,
+               coverage: float = road_coverage) -> Grid | None:
     #obstacles: optional mesh of things under the road to keep `clearance` above
     #margin: extra columns past each road edge (ground engagement), topo sampled under them
+    #coverage: share of a column's top cell that must be on the road surface to build under it
     tol = sc.doc.ModelAbsoluteTolerance
     guides = road_guides(road)
     if guides is None:
         return None
     centerline, edge_a, edge_b = guides
+    flat_edges = [rg.Curve.ProjectToPlane(e, rg.Plane.WorldXY) for e in (edge_a, edge_b)]
 
     # ----- 1. cell boundaries along the centerline, centered on the road length
     length = centerline.GetLength()
@@ -1073,7 +1236,7 @@ def build_grid(road, topo, node_distance: float, floor_height: float,
         print("Road is shorter than one node distance")
         return None
     start = (length - n_div * node_distance) / 2
-    frames = [road_frame(centerline, (edge_a, edge_b), start + b * node_distance)
+    frames = [road_frame(centerline, (edge_a, edge_b), start + b * node_distance, flat_edges)
               for b in range(n_div + 1)]
 
     # ----- 2. cell boundaries across the road, every node_distance from the centerline
@@ -1101,13 +1264,24 @@ def build_grid(road, topo, node_distance: float, floor_height: float,
                 if t >= 0:
                     depth[b, c] = t
 
-    # ----- 4. obstacles: stop each column short of the clearance above them
+    # ----- 4. cell checks: skewed / squished cells are never used; under the road, a column
+    #          also needs `coverage` of its cell on the road surface (steps angled ends)
+    column_ok = cell_quality_ok(top, node_distance)
+    ok = corner_ok
+    candidates = ok[:-1, :-1] & ok[1:, :-1] & ok[1:, 1:] & ok[:-1, 1:] & column_ok
+    road_mesh = rg.Mesh()
+    for part in rg.Mesh.CreateFromBrep(road, rg.MeshingParameters.Default) or []:
+        road_mesh.Append(part)
+    on_road = road_coverage_ok(top, candidates, road_mesh, coverage)
+
+    # ----- 5. obstacles: stop each column short of the clearance above them
     obstacle_depth = None
     if obstacles is not None and obstacles.Faces.Count > 0:
         obstacle_depth = obstacle_clearance_depth(top, np.isfinite(depth), obstacles, clearance)
 
-    # ----- 5. stack floors down to the topo / obstacle clearance
-    grid = grid_from_road_samples(top, corner_ok, depth, floor_height, tol, obstacle_depth)
+    # ----- 6. stack floors down to the topo / obstacle clearance
+    grid = grid_from_road_samples(top, corner_ok, depth, floor_height, tol, obstacle_depth,
+                                  column_ok, on_road)
     if grid is None:
         print("No room for a single floor between the road and the topo")
         return None
@@ -1191,101 +1365,247 @@ def draw(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
 #=================================================
 #--------------------------------------------- MAIN
 
-def ask_shared_weight(default: float):
-    #Ask for the shared space weight only (apartment weights are fixed in the parameters).
-    #Starts from the last value used this Rhino session (falls back to the parameter).
-    #Returns the weight, or None if cancelled.
-    last = sc.sticky.get("shared_space_weight", default)
-    shared_weight = rs.GetReal("Shared space weight (higher = more shared space, less dense)", last, 0.0)
-    if shared_weight is None:
-        return None
-    sc.sticky["shared_space_weight"] = shared_weight
-    return shared_weight
+# ----- settings window: every setting in one window, grouped into sections
+# Each section starts from the values used last in this Rhino session (sc.sticky), falling back
+# to the parameters at the top of this script. Hover a setting for a longer explanation.
 
-# condition key -> option name shown in the command line (no spaces allowed)
-CONDITIONS = {
-    "ground_engagement": "GroundEngagement",
-    "pathway_engagement": "PathwayEngagement",
-}
+def remembered(name: str, defaults: dict) -> dict:
+    #Last values used this Rhino session for a section, filled in from the defaults
+    last = sc.sticky.get(name)
+    out = dict(defaults)
+    if isinstance(last, dict):
+        out.update({k: v for k, v in last.items() if k in defaults})
+    return out
 
-def ask_conditions():
-    #Normal, or Conditions with an On/Off toggle per condition.
-    #Starts from the last choices made this Rhino session.
-    #Returns {condition: bool} (all False for Normal), or None if cancelled.
-    mode = rs.GetString("Generation mode", sc.sticky.get("generation_mode", "Normal"),
-                        ["Normal", "Conditions"])
-    if mode is None:
-        return None
-    mode = "Conditions" if mode.lower().startswith("c") else "Normal"
-    sc.sticky["generation_mode"] = mode
-    if mode == "Normal":
-        return {key: False for key in CONDITIONS}
+def hint_label(text: str):
+    #Small grey explanation line
+    label = forms.Label()
+    label.Text = text
+    label.TextColor = drawing.Colors.Gray
+    label.Wrap = forms.WrapMode.Word
+    return label
 
-    last = sc.sticky.get("conditions", {key: True for key in CONDITIONS})
-    go = Rhino.Input.Custom.GetOption()
-    go.SetCommandPrompt("Conditions to turn on (Enter when done)")
-    go.AcceptNothing(True)
-    toggles = {}
-    for key, label in CONDITIONS.items():
-        toggles[key] = Rhino.Input.Custom.OptionToggle(last.get(key, True), "Off", "On")
-        go.AddOptionToggle(label, toggles[key])
-    while True:
-        res = go.Get()
-        if res == Rhino.Input.GetResult.Option:
-            continue
-        if res == Rhino.Input.GetResult.Nothing:
-            break
-        return None
-    on = {key: bool(t.CurrentValue) for key, t in toggles.items()}
-    sc.sticky["conditions"] = on
-    return on
+def number_row(field: dict):
+    #(label, slider or None, number box) for one numeric setting, the slider and box kept in sync.
+    #Fractions slide in hundredths; whole numbers slide in steps of 1.
+    is_int = field["kind"] == "int"
+    low, high = float(field.get("low", 0)), float(field.get("high", 1e6))
+    box = forms.NumericStepper()
+    box.DecimalPlaces = 0 if is_int else field.get("decimals", 2)
+    box.Increment = field.get("step", 1.0 if is_int else 0.05)
+    box.MinValue, box.MaxValue = low, high
+    box.Value = min(max(float(field["value"]), low), high)
+    box.Width = 75
+    label = forms.Label()
+    label.Text = field["label"]
+    label.VerticalAlignment = forms.VerticalAlignment.Center
+    label.Width = 170
+    if field.get("hint"):
+        label.ToolTip = box.ToolTip = field["hint"]
+    slider = None
+    if "high" in field:
+        scale = 1 if is_int else 100
+        slider = forms.Slider()
+        slider.MinValue, slider.MaxValue = int(round(low * scale)), int(round(high * scale))
+        slider.Value = int(round(box.Value * scale))
+        slider.TickFrequency = max(1, (slider.MaxValue - slider.MinValue) // 10)   # about 10 ticks
+        slider.Width = 160
+        if field.get("hint"):
+            slider.ToolTip = field["hint"]
+        syncing = [False]
 
-def ask_ground_engagement():
-    #Pod settings, starting from the last values used this Rhino session.
-    #Returns (spacing, length, spill, floors, void), or None if cancelled.
-    defaults = (ge_spacing, ge_length, ge_spill, ge_floors, ge_void)
-    last = sc.sticky.get("ground_engagement", defaults)
-    if len(last) != len(defaults):          # saved by an older version of this script
-        last = defaults
-    prompts = ("Ground engagement: nodes between pod centers",
-               "Ground engagement: pod length along the road (nodes)",
-               "Ground engagement: spill past each road edge (nodes)",
-               "Ground engagement: public floors from the topo")
-    values = []
-    for prompt, default, low in zip(prompts, last, (1, 1, 0, 1)):
-        v = rs.GetInteger(prompt, default, low)
-        if v is None:
-            return None
-        values.append(v)
-    void = rs.GetReal("Ground engagement: share of pod nodes left as voids (0 = solid)", last[4], 0.0, 1.0)
-    if void is None:
-        return None
-    values.append(void)
-    sc.sticky["ground_engagement"] = tuple(values)
-    return tuple(values)
+        def from_slider(sender, e):
+            if not syncing[0]:
+                syncing[0] = True
+                box.Value = slider.Value / scale
+                syncing[0] = False
 
-def ask_pathway_engagement():
-    #Pod settings, starting from the last values used this Rhino session.
-    #Returns (width, spill, floors, void), or None if cancelled.
-    defaults = (pe_width, pe_spill, pe_floors, pe_void)
-    last = sc.sticky.get("pathway_engagement_pod", defaults)
-    if len(last) != len(defaults):
-        last = defaults
-    prompts = ("Pathway engagement: growth along the road on each side of the crossing (nodes)",
-               "Pathway engagement: spill past each road edge (nodes)",
-               "Pathway engagement: public floors from the topo")
-    values = []
-    for prompt, default, low in zip(prompts, last, (1, 0, 1)):
-        v = rs.GetInteger(prompt, default, low)
-        if v is None:
-            return None
-        values.append(v)
-    void = rs.GetReal("Pathway engagement: share of pod nodes left as voids (0 = solid)", last[3], 0.0, 1.0)
-    if void is None:
+        def from_box(sender, e):
+            if not syncing[0]:
+                syncing[0] = True
+                slider.Value = int(round(box.Value * scale))
+                syncing[0] = False
+
+        slider.ValueChanged += from_slider
+        box.ValueChanged += from_box
+    return label, slider, box
+
+def settings_section(title: str, subtitle: str, fields: list[dict],
+                     toggle: dict | None = None, available: bool = True):
+    #A boxed section. toggle = {"label", "value"} adds an on/off checkbox at the top that greys
+    #out the rest of the section when off. available=False keeps the whole section off.
+    #Returns (group box, {key: number box}, checkbox or None).
+    group = forms.GroupBox()
+    group.Text = title
+    group.Padding = drawing.Padding(10, 6, 10, 10)
+    table = forms.TableLayout()
+    table.Spacing = drawing.Size(10, 6)
+    check = None
+    if toggle is not None:
+        check = forms.CheckBox()
+        check.Text = toggle["label"]
+        check.Checked = bool(toggle["value"]) and available
+        check.Enabled = available
+        table.Rows.Add(forms.TableRow(forms.TableCell(check)))
+    if subtitle:
+        table.Rows.Add(forms.TableRow(forms.TableCell(hint_label(subtitle))))
+    rows = forms.TableLayout()
+    rows.Spacing = drawing.Size(10, 6)
+    boxes, dependents = {}, []
+    for f in fields:
+        label, slider, box = number_row(f)
+        rows.Rows.Add(forms.TableRow(forms.TableCell(label, True), forms.TableCell(slider),
+                                     forms.TableCell(box)))
+        boxes[f["key"]] = box
+        dependents += [label, box] + ([slider] if slider is not None else [])
+    table.Rows.Add(forms.TableRow(forms.TableCell(rows)))
+    if check is not None:
+        def refresh(sender=None, e=None):
+            on = bool(check.Checked)
+            for c in dependents:
+                c.Enabled = on
+        check.CheckedChanged += refresh
+        refresh()
+    group.Content = table
+    return group, boxes, check
+
+def read_numbers(fields: list[dict], boxes: dict) -> dict:
+    return {f["key"]: (int(round(boxes[f["key"]].Value)) if f["kind"] == "int"
+                       else float(boxes[f["key"]].Value)) for f in fields}
+
+def pod_section_fields(last: dict, first: list[dict]) -> list[dict]:
+    #The settings every engagement pod shares, after the section's own first settings
+    return first + [
+        dict(key="spill", label="Spill past edge", value=last["spill"], kind="int", low=0, high=10,
+             hint="Nodes the pod reaches past each road edge on the ground floor"),
+        dict(key="floors", label="Public floors", value=last["floors"], kind="int", low=1, high=6,
+             hint="Floors of public space, counted up from the topo"),
+        dict(key="void", label="Voids", value=last["void"], kind="float", low=0.0, high=1.0,
+             hint="Share of the pod's nodes randomly left open (0 = solid)"),
+    ]
+
+def ask_settings(has_obstacles: bool) -> dict | None:
+    #Every setting in one window. Returns
+    #  {"grid": {...}, "conditions": {key: bool}, "ground_engagement": {...},
+    #   "pathway_engagement": {...}, "ends_ramp_down": {...}}
+    #or None if cancelled.
+    ft = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Feet, sc.doc.ModelUnitSystem)
+    grid_last = remembered("grid_settings", {
+        "dist": node_distance, "fh": floor_height or node_distance, "coverage": road_coverage,
+        "spacing": vertcirc_spacing, "shared_weight": float(shared_space_weight),
+        "clearance": obstacle_clearance_ft * ft})
+    on_last = remembered("conditions_on", {k: False for k in
+                                           ("ground_engagement", "pathway_engagement", "ends_ramp_down")})
+    ge_last = remembered("ground_engagement_settings", {
+        "spacing": ge_spacing, "length": ge_length, "spill": ge_spill, "floors": ge_floors, "void": ge_void})
+    pe_last = remembered("pathway_engagement_settings", {
+        "width": pe_width, "spill": pe_spill, "floors": pe_floors, "void": pe_void})
+    er_last = remembered("ends_ramp_down_settings", {
+        "width": er_width, "spill": er_spill, "floors": er_floors, "void": er_void})
+
+    grid_fields = [
+        dict(key="dist", label="Node distance", value=grid_last["dist"], kind="float", low=0.01, step=1,
+             hint="Size of one node (cell) along and across the road, in model units"),
+        dict(key="fh", label="Floor height", value=grid_last["fh"], kind="float", low=0.01, step=1,
+             hint="Height of one floor, in model units"),
+        dict(key="coverage", label="Cell on road", value=grid_last["coverage"], kind="float",
+             low=0.05, high=1.0,
+             hint="Share of a cell that must sit on the road surface. Angled ends become a "
+                  "staircase of whole cells; lower keeps more cells along the angle"),
+        dict(key="spacing", label="Core spacing", value=grid_last["spacing"], kind="int", low=1, high=60,
+             hint="Nodes between vertical circulation cores along the road"),
+        dict(key="shared_weight", label="Shared space", value=grid_last["shared_weight"], kind="float",
+             low=0.0, high=10.0, step=0.25,
+             hint="How often a shared space is placed instead of an apartment (0 = only leftover gaps)"),
+    ]
+    if has_obstacles:
+        grid_fields.append(dict(key="clearance", label="Obstacle clearance", value=grid_last["clearance"],
+                                kind="float", low=0.0, step=1,
+                                hint="Nothing is built within this distance above an obstacle"))
+    ge_fields = pod_section_fields(ge_last, [
+        dict(key="spacing", label="Pod spacing", value=ge_last["spacing"], kind="int", low=1, high=60,
+             hint="Nodes between pod centers along the road"),
+        dict(key="length", label="Pod length", value=ge_last["length"], kind="int", low=1, high=40,
+             hint="Pod length along the road on the ground floor, in nodes"),
+    ])
+    pe_fields = pod_section_fields(pe_last, [
+        dict(key="width", label="Growth each side", value=pe_last["width"], kind="int", low=1, high=15,
+             hint="Nodes the pod grows along the road on each side of the crossing"),
+    ])
+    er_fields = pod_section_fields(er_last, [
+        dict(key="width", label="Growth from end", value=er_last["width"], kind="int", low=1, high=15,
+             hint="Nodes the half pod grows inward from each end"),
+    ])
+
+    grid_box, grid_boxes, _ = settings_section(
+        "Grid and circulation", "Leave every condition off for Normal.", grid_fields)
+    ge_box, ge_boxes, ge_check = settings_section(
+        "Ground engagement", "Public pods at an interval, standing on the topo.", ge_fields,
+        toggle={"label": "Use ground engagement", "value": on_last["ground_engagement"]})
+    pe_box, pe_boxes, pe_check = settings_section(
+        "Pathway engagement",
+        "A pod split by each road that crosses under." if has_obstacles
+        else "Pick the crossing roads as obstacles to use this.",
+        pe_fields, toggle={"label": "Use pathway engagement", "value": on_last["pathway_engagement"]},
+        available=has_obstacles)
+    er_box, er_boxes, er_check = settings_section(
+        "Ends / ramp down", "Half a pod at each short end of the generation.", er_fields,
+        toggle={"label": "Use ends / ramp down", "value": on_last["ends_ramp_down"]})
+
+    dialog = forms.Dialog()
+    dialog.Title = "Generator settings"
+    dialog.Padding = drawing.Padding(14)
+    dialog.Resizable = False
+    result = {"ok": False}
+    generate, cancel = forms.Button(), forms.Button()
+    generate.Text, cancel.Text = "Generate", "Cancel"
+
+    def on_generate(sender, e):
+        result["ok"] = True
+        dialog.Close()
+
+    def on_cancel(sender, e):
+        dialog.Close()
+
+    generate.Click += on_generate
+    cancel.Click += on_cancel
+    dialog.DefaultButton, dialog.AbortButton = generate, cancel
+
+    left, right = forms.StackLayout(), forms.StackLayout()
+    for column, boxes in ((left, (grid_box, ge_box)), (right, (pe_box, er_box))):
+        column.Spacing = 10
+        column.HorizontalContentAlignment = forms.HorizontalAlignment.Stretch
+        for b in boxes:
+            column.Items.Add(forms.StackLayoutItem(b))
+    buttons = forms.TableLayout()
+    buttons.Spacing = drawing.Size(8, 0)
+    buttons.Rows.Add(forms.TableRow(forms.TableCell(None, True), forms.TableCell(cancel),
+                                    forms.TableCell(generate)))
+    page = forms.TableLayout()
+    page.Spacing = drawing.Size(12, 12)
+    page.Rows.Add(forms.TableRow(forms.TableCell(left, True), forms.TableCell(right, True)))
+    page.Rows.Add(forms.TableRow(forms.TableCell(None), forms.TableCell(buttons)))
+    dialog.Content = page
+    dialog.ShowModal(Rhino.UI.RhinoEtoApp.MainWindow)
+    if not result["ok"]:
         return None
-    values.append(void)
-    sc.sticky["pathway_engagement_pod"] = tuple(values)
-    return tuple(values)
+
+    out = {
+        "grid": dict(grid_last, **read_numbers(grid_fields, grid_boxes)),
+        "conditions": {"ground_engagement": bool(ge_check.Checked),
+                       "pathway_engagement": bool(pe_check.Checked) and has_obstacles,
+                       "ends_ramp_down": bool(er_check.Checked)},
+        "ground_engagement": read_numbers(ge_fields, ge_boxes),
+        "pathway_engagement": read_numbers(pe_fields, pe_boxes),
+        "ends_ramp_down": read_numbers(er_fields, er_boxes),
+    }
+    sc.sticky["grid_settings"] = out["grid"]
+    sc.sticky["conditions_on"] = {k: (v or (k == "pathway_engagement" and on_last[k] and not has_obstacles))
+                                  for k, v in out["conditions"].items()}
+    sc.sticky["ground_engagement_settings"] = out["ground_engagement"]
+    sc.sticky["pathway_engagement_settings"] = out["pathway_engagement"]
+    sc.sticky["ends_ramp_down_settings"] = out["ends_ramp_down"]
+    return out
 
 def main():
     road = pick_road()
@@ -1297,48 +1617,32 @@ def main():
     obstacles = pick_obstacles()
     if obstacles is None:
         return
-    clearance = 0.0
-    if obstacles.Faces.Count > 0:
-        ft = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Feet, sc.doc.ModelUnitSystem)
-        clearance = rs.GetReal("Clearance above obstacles (model units)", obstacle_clearance_ft * ft, 0.0)
-        if clearance is None:
-            return
+    has_obstacles = obstacles.Faces.Count > 0
 
-    dist = rs.GetReal("Node distance", node_distance, 0.001)
-    if dist is None:
+    settings = ask_settings(has_obstacles)
+    if settings is None:
         return
-    fh = rs.GetReal("Floor height", floor_height or dist, 0.001)
-    if fh is None:
-        return
-    spacing = rs.GetInteger("Vertical circulation spacing (nodes)", vertcirc_spacing, 1)
-    if spacing is None:
-        return
-    shared_weight = ask_shared_weight(shared_space_weight)
-    if shared_weight is None:
-        return
-    conditions = ask_conditions()
-    if conditions is None:
-        return
-    ge = None
-    if conditions["ground_engagement"]:
-        ge = ask_ground_engagement()
-        if ge is None:
-            return
-    pe = None
-    if conditions["pathway_engagement"]:
-        if obstacles.Faces.Count == 0:
-            print("Pathway engagement needs obstacles (the crossing roads or paths); skipped")
-        else:
-            pe = ask_pathway_engagement()
-            if pe is None:
-                return
+    grid_set, conditions = settings["grid"], settings["conditions"]
+    dist, fh, coverage = grid_set["dist"], grid_set["fh"], grid_set["coverage"]
+    spacing, shared_weight = grid_set["spacing"], grid_set["shared_weight"]
+    clearance = grid_set["clearance"] if has_obstacles else 0.0
+    g, p_, e = settings["ground_engagement"], settings["pathway_engagement"], settings["ends_ramp_down"]
+    ge = ((g["spacing"], g["length"], g["spill"], g["floors"], g["void"])
+          if conditions["ground_engagement"] else None)
+    pe = ((p_["width"], p_["spill"], p_["floors"], p_["void"])
+          if conditions["pathway_engagement"] else None)
+    er = ((e["width"], e["spill"], e["floors"], e["void"])
+          if conditions["ends_ramp_down"] else None)
 
     # ----- generate (internal only, nothing drawn yet)
-    margin = max(ge[2] if ge else 0, pe[1] if pe else 0)
-    grid = build_grid(road, topo, dist, fh, obstacles, clearance, margin)
+    margin = max(ge[2] if ge else 0, pe[1] if pe else 0, er[1] if er else 0)
+    grid = build_grid(road, topo, dist, fh, obstacles, clearance, margin, coverage)
     if grid is None:
         return
+    # circulation first: cores, then the shared landings around them on every floor, so the
+    # engagement conditions below work around them and never take their place
     cores = place_vertcirc(grid, spacing)
+    core_shared = place_core_shared(grid, cores)
     public, voids, crossings = [], {}, 0
     if ge:
         g_spacing, g_length, g_spill, g_floors, g_void = ge
@@ -1352,7 +1656,11 @@ def main():
         public += blocks
         if crossings == 0:
             print("Pathway engagement: no obstacle crosses under the road, nothing added")
-    core_shared = place_core_shared(grid, cores)
+    if er:
+        e_width, e_spill, e_floors, e_void = er
+        blocks, voids["Ends / ramp down"] = place_ends_ramp_down(
+            grid, e_width, e_spill, e_floors, void=e_void)
+        public += blocks
     apartments, scattered, filler = [], [], []
     for k in range(grid.shape[2]):
         a, s, f = populate(grid, floor=k, shared_weight=shared_weight)
