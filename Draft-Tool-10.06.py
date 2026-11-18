@@ -1317,6 +1317,31 @@ DEFAULT_WEIGHTS = {
     "bedroom": 2.0, "bathroom": 2.0, "living": 1.0, "kitchen": 1.0,
 }
 
+# Pareto front: the scores compared across runs (chosen in the "Scoring weights" window).
+# A run is on the front if no other run is at least as good on every one of these scores and
+# better on at least one. Pick 2-3: with all five, almost every run is best at something.
+SCORE_NAMES = ("light", "community", "privacy", "density", "walking")
+DEFAULT_PARETO_SCORES = ("density", "light", "walking")
+
+def pareto_flags(points: list[tuple | None]) -> list[bool]:
+    #True for each point that no other point dominates (higher is better on every axis).
+    #None = missing scores, never on the front.
+    flags = []
+    for a in points:
+        if a is None:
+            flags.append(False)
+            continue
+        dominated = any(b is not None and all(y >= x for x, y in zip(a, b)) and any(y > x for x, y in zip(a, b))
+                        for b in points)
+        flags.append(not dominated)
+    return flags
+
+def pareto_scores_chosen() -> tuple:
+    chosen = sc.sticky.get("pareto_scores")
+    if not chosen or not all(c in SCORE_NAMES for c in chosen):
+        return DEFAULT_PARETO_SCORES
+    return tuple(chosen)
+
 def open_air(grid: Grid, i: int, j: int, k: int) -> bool:
     #Off the grid or open air (past the road edge, a void, an obstacle's clearance)
     return not grid.in_bounds(i, j, k) or grid.states[i, j, k] == ProgramState.OUTSIDE
@@ -1603,37 +1628,78 @@ def format_evaluation(result: dict) -> str:
     ]
     return "\n".join(lines)
 
-def save_evaluation(result: dict, settings: dict) -> str | None:
-    #Append this run to <file>_evaluation_runs.csv and its apartments to
-    #<file>_evaluation_apartments.csv, next to the Rhino file (Documents if it isn't saved).
-    #Returns the folder, or None if the files couldn't be written.
+def save_evaluation(result: dict, settings: dict) -> dict | None:
+    #Adds this run to <file>_evaluation_runs.csv and its apartments to <file>_evaluation_apartments.csv,
+    #next to the Rhino file (Documents if it isn't saved). The runs file is rewritten every time with
+    #a "pareto_front" column (yes / no) worked out over all runs in it, using the chosen scores.
+    #Returns {"folder", "runs", "front": [run rows on the front], "on_front": bool, "scores"},
+    #or None if the files couldn't be written (e.g. open in Excel).
     import csv, os, datetime
     folder = os.path.dirname(sc.doc.Path) if sc.doc.Path else os.path.join(os.path.expanduser("~"), "Documents")
     name = os.path.splitext(sc.doc.Name)[0] if sc.doc.Name else "untitled"
     run = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    runs_path = os.path.join(folder, f"{name}_evaluation_runs.csv")
+    apts_path = os.path.join(folder, f"{name}_evaluation_apartments.csv")
+    chosen = pareto_scores_chosen()
 
-    def append(path, rows):
-        if not rows:
-            return
-        fields = list(rows[0].keys())
-        new = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            if new:
-                writer.writeheader()
+    row = {"run": run, "seed": settings.get("seed", "")}
+    row.update({f"set_{k}": v for k, v in settings.items() if k != "seed"})
+    row.update({k: (" ".join(map(str, v)) if isinstance(v, list) else v) for k, v in result["summary"].items()})
+    row = {k: ("" if v is None else str(v)) for k, v in row.items()}
+
+    try:
+        rows, fields = [], []
+        if os.path.exists(runs_path):
+            with open(runs_path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+        rows.append(row)
+        for key in list(row.keys()) + ["pareto_front", "pareto_scores"]:
+            if key not in fields:
+                fields.append(key)
+
+        def point(r):
+            try:
+                return tuple(float(r[f"score_{c}"]) for c in chosen)
+            except (KeyError, ValueError, TypeError):
+                return None
+
+        flags = pareto_flags([point(r) for r in rows])
+        for r, on in zip(rows, flags):
+            r["pareto_front"] = "yes" if on else "no"
+            r["pareto_scores"] = "+".join(chosen)
+        with open(runs_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, restval="")
+            writer.writeheader()
             writer.writerows(rows)
 
-    summary = {"run": run, **{f"set_{k}": v for k, v in settings.items()}}
-    summary.update({k: (" ".join(map(str, v)) if isinstance(v, list) else v)
-                    for k, v in result["summary"].items()})
-    try:
-        append(os.path.join(folder, f"{name}_evaluation_runs.csv"), [summary])
-        append(os.path.join(folder, f"{name}_evaluation_apartments.csv"),
-               [{"run": run, **r} for r in result["apartments"]])
+        apt_rows = [{"run": run, **r} for r in result["apartments"]]
+        if apt_rows:
+            new = not os.path.exists(apts_path)
+            with open(apts_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(apt_rows[0].keys()), extrasaction="ignore")
+                if new:
+                    writer.writeheader()
+                writer.writerows(apt_rows)
     except OSError as e:
-        print(f"Evaluation: couldn't write the CSV files ({e})")
+        print(f"Evaluation: couldn't write the CSV files ({e}). Close them if they're open in Excel.")
         return None
-    return folder
+    return {"folder": folder, "runs": len(rows), "scores": chosen, "on_front": flags[-1],
+            "front": [r for r, on in zip(rows, flags) if on]}
+
+def format_front(saved: dict, this_run: bool = True) -> str:
+    #Printout of the Pareto front over every run in the runs file.
+    #this_run: also say whether the latest run is on it (single runs).
+    chosen = saved["scores"]
+    lines = [f"Pareto front ({' / '.join(chosen)}): {len(saved['front'])} of {saved['runs']} runs in the file"
+             + (f" - this run is {'ON' if saved['on_front'] else 'not on'} the front" if this_run else "")]
+    for r in saved["front"][-12:]:
+        scores = ", ".join(f"{c} {r.get('score_' + c, '')}" for c in chosen)
+        lines.append(f"    {r.get('run', '')}  seed {r.get('seed') or '-':>6}  {scores}")
+    if len(saved["front"]) > 12:
+        lines.append(f"    ... {len(saved['front']) - 12} more in the CSV (pareto_front = yes)")
+    return "\n".join(lines)
 
 #=================================================
 #--------------------------------------------- DRAW
@@ -1666,10 +1732,12 @@ def program_brep(grid: Grid, program: Program):
         brep.Flip()
     return brep
 
-def add_program(grid: Grid, program: Program, name: str):
+def add_program(grid: Grid, program: Program, name: str, offset: rg.Vector3d | None = None):
     brep = program_brep(grid, program)
     if brep is None:
         return None
+    if offset is not None:
+        brep.Transform(rg.Transform.Translation(offset))
     attr = Rhino.DocObjects.ObjectAttributes()
     attr.LayerIndex = program_layer(program.type)
     attr.Name = name
@@ -1678,34 +1746,330 @@ def add_program(grid: Grid, program: Program, name: str):
 
 def draw(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
          apartments: Sequence[Apartment], scattered: Sequence[Program],
-         filler: Sequence[Program], public: Sequence[Block] = ()) -> None:
+         filler: Sequence[Program], public: Sequence[Block] = (),
+         offset: rg.Vector3d | None = None, prefix: str = "") -> None:
+    #offset: shift everything (drawing batch runs side by side); prefix: added to every name
+    def add(program, name):
+        return add_program(grid, program, prefix + name, offset)
     sc.doc.Views.RedrawEnabled = False
     try:
         for group in sorted({b.group for b in public}):
-            ids = [add_program(grid, b, f"public floor {b.origin.k} - {group}")
+            ids = [add(b, f"public floor {b.origin.k} - {group}")
                    for b in public if b.group == group]
             ids = [i for i in ids if i is not None]
             if ids:
                 sc.doc.Groups.Add(List[System.Guid](ids))   # one group per pod / wing
         for n, c in enumerate(cores, 1):
-            add_program(grid, c, f"vertical circulation #{n} - {c.height} floors")
+            add(c, f"vertical circulation #{n} - {c.height} floors")
         for s in core_shared:
-            add_program(grid, s, f"shared floor {s.origin.k} - {s.code} (around vertical circulation)")
+            add(s, f"shared floor {s.origin.k} - {s.code} (around vertical circulation)")
         for apt in apartments:
-            ids = [add_program(grid, p, f"{apt.type} #{apt.number} floor {apt.floor} - {p.code}")
+            ids = [add(p, f"{apt.type} #{apt.number} floor {apt.floor} - {p.code}")
                    for p in apt.programs]
-            ids += [add_program(grid, s, f"{apt.type} #{apt.number} floor {apt.floor} - living room opening")
+            ids += [add(s, f"{apt.type} #{apt.number} floor {apt.floor} - living room opening")
                     for s in apt.shared]
             ids = [i for i in ids if i is not None]
             if ids:
                 sc.doc.Groups.Add(List[System.Guid](ids))   # one group per apartment
         for s in scattered:
-            add_program(grid, s, f"shared floor {s.origin.k} - {s.code} (between apartments)")
+            add(s, f"shared floor {s.origin.k} - {s.code} (between apartments)")
         for s in filler:
-            add_program(grid, s, f"shared floor {s.origin.k} - {s.code} (leftover fill)")
+            add(s, f"shared floor {s.origin.k} - {s.code} (leftover fill)")
     finally:
         sc.doc.Views.RedrawEnabled = True
         sc.doc.Views.Redraw()
+
+#=================================================
+#--------------------------------------------- BATCH
+# Generates and evaluates many runs in one go without drawing them: every run gets its own seed,
+# and the settings ticked in the batch window are picked at random within their range. Every run
+# is saved to the runs CSV (with its seed and settings, so any run can be rebuilt as a single run).
+
+# (section, key) -> (label, kind, lowest allowed, highest allowed, default from, default to, ticked)
+BATCH_PARAMS = [
+    ("grid", "shared_weight", "Shared space weight", "float", 0.0, 10.0, 0.0, 4.0, True),
+    ("grid", "spacing", "Core spacing", "int", 1, 60, 12, 28, True),
+    ("ground_engagement", "spacing", "Ground: pod spacing", "int", 1, 60, 15, 40, True),
+    ("ground_engagement", "length", "Ground: pod length", "int", 1, 40, 6, 14, True),
+    ("ground_engagement", "spill", "Ground: spill past edge", "int", 0, 10, 2, 6, False),
+    ("ground_engagement", "floors", "Ground: public floors", "int", 1, 6, 1, 3, False),
+    ("ground_engagement", "void", "Ground: voids", "float", 0.0, 1.0, 0.0, 0.15, False),
+    ("pathway_engagement", "width", "Pathway: growth each side", "int", 1, 15, 3, 8, False),
+    ("pathway_engagement", "spill", "Pathway: spill past edge", "int", 0, 10, 2, 6, False),
+    ("pathway_engagement", "floors", "Pathway: public floors", "int", 1, 6, 1, 3, False),
+    ("pathway_engagement", "void", "Pathway: voids", "float", 0.0, 1.0, 0.0, 0.15, False),
+    ("ends_ramp_down", "width", "Ends: growth from end", "int", 1, 15, 3, 8, False),
+    ("ends_ramp_down", "spill", "Ends: spill past edge", "int", 0, 10, 2, 6, False),
+    ("ends_ramp_down", "floors", "Ends: public floors", "int", 1, 6, 1, 3, False),
+    ("ends_ramp_down", "void", "Ends: voids", "float", 0.0, 1.0, 0.0, 0.15, False),
+]
+BATCH_DRAW = ("Nothing (just the CSV)", "The best run (overall score)", "Every Pareto front run, side by side")
+
+def generate(base_grid: Grid, spacing: int, shared_weight: float, ge, pe, er, seed: int) -> dict:
+    #One complete generation on a copy of base_grid. ge / pe / er are the condition settings
+    #(None = off). Every random choice follows from `seed`, so the same inputs give the same layout.
+    random.seed(seed)
+    grid = copy.deepcopy(base_grid)
+    # circulation first: cores, then the shared landings around them on every floor, so the
+    # engagement conditions below work around them and never take their place
+    cores = place_vertcirc(grid, spacing)
+    core_shared = place_core_shared(grid, cores)
+    public, voids, crossings = [], {}, 0
+    if ge:
+        g_spacing, g_length, g_spill, g_floors, g_void = ge
+        blocks, voids["Ground engagement"] = place_ground_engagement(
+            grid, g_spacing, g_length, g_spill, g_floors, void=g_void)
+        public += blocks
+    if pe:
+        p_width, p_spill, p_floors, p_void = pe
+        blocks, crossings, voids["Pathway engagement"] = place_pathway_engagement(
+            grid, p_width, p_spill, p_floors, void=p_void)
+        public += blocks
+        if crossings == 0:
+            print("Pathway engagement: no obstacle crosses under the road, nothing added")
+    if er:
+        e_width, e_spill, e_floors, e_void = er
+        blocks, voids["Ends / ramp down"] = place_ends_ramp_down(
+            grid, e_width, e_spill, e_floors, void=e_void)
+        public += blocks
+    apartments, scattered, filler = [], [], []
+    for k in range(grid.shape[2]):
+        a, s, f = populate(grid, floor=k, shared_weight=shared_weight)
+        apartments += a
+        scattered += s
+        filler += f
+    for n, apt in enumerate(apartments, 1):
+        apt.number = n
+    return dict(grid=grid, cores=cores, core_shared=core_shared, apartments=apartments,
+                scattered=scattered, filler=filler, public=public, voids=voids, crossings=crossings)
+
+def condition_tuples(conditions: dict, sections: dict):
+    #(ge, pe, er) settings tuples for generate(), None for a condition that is off
+    g, p, e = sections["ground_engagement"], sections["pathway_engagement"], sections["ends_ramp_down"]
+    ge = (g["spacing"], g["length"], g["spill"], g["floors"], g["void"]) if conditions["ground_engagement"] else None
+    pe = (p["width"], p["spill"], p["floors"], p["void"]) if conditions["pathway_engagement"] else None
+    er = (e["width"], e["spill"], e["floors"], e["void"]) if conditions["ends_ramp_down"] else None
+    return ge, pe, er
+
+def grid_margin(ge, pe, er) -> int:
+    #Extra columns past each road edge the conditions need (their largest spill)
+    return max(ge[2] if ge else 0, pe[1] if pe else 0, er[1] if er else 0)
+
+def run_settings_row(grid_set: dict, seed: int, conditions: dict, sections: dict) -> dict:
+    #The settings saved with a run in the runs CSV
+    row = dict(grid_set)
+    row["seed"] = seed
+    row.update(conditions)
+    for key in ("ground_engagement", "pathway_engagement", "ends_ramp_down"):
+        if conditions[key]:
+            row.update({f"{key}_{k}": v for k, v in sections[key].items()})
+    return row
+
+def ask_batch(owner, has_obstacles: bool) -> dict | None:
+    #The batch window. Returns {"runs", "draw", "toggle_conditions", "vary": {(section, key): (lo, hi, kind)}}
+    #or None if cancelled.
+    last = sc.sticky.get("batch_settings") or {}
+    run_fields = [dict(key="runs", label="Runs", value=last.get("runs", 20), kind="int", low=1, high=300,
+                       hint="How many layouts to generate and evaluate")]
+    run_box, run_boxes, _ = settings_section("Batch", "Each run gets its own seed and is saved to the runs CSV. "
+                                             "Press Esc in Rhino to stop early.", run_fields)
+
+    draw_list = forms.RadioButtonList()
+    draw_list.Orientation = forms.Orientation.Vertical
+    for text in BATCH_DRAW:
+        draw_list.Items.Add(text)
+    draw_list.SelectedIndex = int(last.get("draw", 1))
+    toggle = forms.CheckBox()
+    toggle.Text = "Turn each condition on or off at random"
+    toggle.Checked = bool(last.get("toggle_conditions", False))
+    toggle.ToolTip = "Off: every run uses the conditions ticked in the settings window"
+    run_layout = forms.StackLayout()          # stacked from the top, no stretching
+    run_layout.Spacing = 8
+    run_layout.HorizontalContentAlignment = forms.HorizontalAlignment.Stretch
+    for item in (run_box, hint_label("Draw afterwards"), draw_list, toggle):
+        run_layout.Items.Add(forms.StackLayoutItem(item))
+
+    # vary: one row per setting, a tick box and a from / to range
+    vary_layout = forms.TableLayout()
+    vary_layout.Spacing = drawing.Size(8, 5)
+    hdr = [hint_label("Pick at random"), hint_label("from"), hint_label("to")]
+    vary_layout.Rows.Add(forms.TableRow(forms.TableCell(hdr[0], True), forms.TableCell(hdr[1]), forms.TableCell(hdr[2])))
+    rows = {}
+    saved_vary = last.get("vary", {})
+    for section, key, text, kind, low, high, lo_default, hi_default, ticked in BATCH_PARAMS:
+        name = f"{section}.{key}"
+        check = forms.CheckBox()
+        check.Text = text
+        prev = saved_vary.get(name)
+        check.Checked = bool(prev[2]) if prev else ticked
+        if section == "pathway_engagement" and not has_obstacles:
+            check.Checked, check.Enabled = False, False
+        boxes = []
+        for value in ((prev[0] if prev else lo_default), (prev[1] if prev else hi_default)):
+            box = forms.NumericStepper()
+            box.DecimalPlaces = 0 if kind == "int" else 2
+            box.Increment = 1.0 if kind == "int" else 0.05
+            box.MinValue, box.MaxValue = float(low), float(high)
+            box.Value = float(value)
+            box.Width = 70
+            boxes.append(box)
+        vary_layout.Rows.Add(forms.TableRow(forms.TableCell(check, True), forms.TableCell(boxes[0]),
+                                            forms.TableCell(boxes[1])))
+        rows[(section, key)] = (check, boxes[0], boxes[1], kind)
+    vary_box = forms.GroupBox()
+    vary_box.Text = "Vary between runs"
+    vary_box.Padding = drawing.Padding(10, 6, 10, 10)
+    vary_box.Content = vary_layout
+
+    dialog = forms.Dialog()
+    dialog.Title = "Batch runs"
+    dialog.Padding = drawing.Padding(14)
+    dialog.Resizable = False
+    result = {"ok": False}
+    start, cancel = forms.Button(), forms.Button()
+    start.Text, cancel.Text = "Run batch", "Cancel"
+
+    def on_start(sender, e):
+        result["ok"] = True
+        dialog.Close()
+
+    def on_cancel(sender, e):
+        dialog.Close()
+
+    start.Click += on_start
+    cancel.Click += on_cancel
+    dialog.DefaultButton, dialog.AbortButton = start, cancel
+    buttons = forms.TableLayout()
+    buttons.Spacing = drawing.Size(8, 0)
+    buttons.Rows.Add(forms.TableRow(forms.TableCell(None, True), forms.TableCell(cancel), forms.TableCell(start)))
+    page = forms.TableLayout()
+    page.Spacing = drawing.Size(12, 12)
+    page.Rows.Add(forms.TableRow(forms.TableCell(run_layout), forms.TableCell(vary_box, True)))
+    page.Rows.Add(forms.TableRow(forms.TableCell(None), forms.TableCell(buttons)))
+    dialog.Content = page
+    dialog.ShowModal(owner or Rhino.UI.RhinoEtoApp.MainWindow)
+    if not result["ok"]:
+        return None
+
+    vary, remember = {}, {}
+    for (section, key), (check, lo_box, hi_box, kind) in rows.items():
+        lo, hi = sorted((lo_box.Value, hi_box.Value))
+        if kind == "int":
+            lo, hi = int(round(lo)), int(round(hi))
+        remember[f"{section}.{key}"] = (lo, hi, bool(check.Checked))
+        if check.Checked and check.Enabled:
+            vary[(section, key)] = (lo, hi, kind)
+    config = {"runs": int(round(run_boxes["runs"].Value)), "draw": int(draw_list.SelectedIndex),
+              "toggle_conditions": bool(toggle.Checked), "vary": vary}
+    sc.sticky["batch_settings"] = {"runs": config["runs"], "draw": config["draw"],
+                                   "toggle_conditions": config["toggle_conditions"], "vary": remember}
+    return config
+
+def run_batch(road, topo, obstacles, has_obstacles: bool, settings: dict, batch: dict) -> list[dict]:
+    #Generates, evaluates and saves batch["runs"] runs, then draws what the batch window asked for.
+    #Returns the runs (each {gen, result, row, seed}).
+    import io, contextlib
+    ft = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Feet, sc.doc.ModelUnitSystem)
+    weights = remembered("evaluation_weights", DEFAULT_WEIGHTS)
+    picker = random.Random(random.SystemRandom().randrange(1, 2 ** 31))
+    grids = {}                                    # margin -> grid built for it (built once each)
+    done, saved = [], None
+    n = batch["runs"]
+    print(f"Batch: {n} runs. Press Esc to stop early.")
+    Rhino.UI.StatusBar.ShowProgressMeter(0, n, "Batch runs", True, True)
+    try:
+        for i in range(n):
+            if sc.escape_test(False):
+                print(f"Batch stopped after {len(done)} runs")
+                break
+            grid_set = dict(settings["grid"])
+            sections = {k: dict(settings[k]) for k in ("ground_engagement", "pathway_engagement", "ends_ramp_down")}
+            conditions = dict(settings["conditions"])
+            if batch["toggle_conditions"]:
+                conditions = {k: picker.random() < 0.5 for k in conditions}
+            if not has_obstacles:
+                conditions["pathway_engagement"] = False
+            for (section, key), (lo, hi, kind) in batch["vary"].items():
+                value = picker.randint(lo, hi) if kind == "int" else round(picker.uniform(lo, hi), 2)
+                (grid_set if section == "grid" else sections[section])[key] = value
+            ge, pe, er = condition_tuples(conditions, sections)
+            margin = grid_margin(ge, pe, er)
+            if margin not in grids:
+                clearance = grid_set["clearance"] if has_obstacles else 0.0
+                grids[margin] = build_grid(road, topo, grid_set["dist"], grid_set["fh"], obstacles,
+                                           clearance, margin, grid_set["coverage"])
+            if grids[margin] is None:
+                print("Batch: no room for a single floor between the road and the topo")
+                return done
+            seed = picker.randrange(1, 1000000)
+            with contextlib.redirect_stdout(io.StringIO()):       # keep the command line readable
+                gen = generate(grids[margin], grid_set["spacing"], grid_set["shared_weight"], ge, pe, er, seed)
+                result = evaluate(gen["grid"], gen["cores"], gen["apartments"], gen["scattered"],
+                                  gen["filler"], ft, weights)
+            row = run_settings_row(grid_set, seed, conditions, sections)
+            saved = save_evaluation(result, row) or saved
+            s = result["summary"]
+            on = "".join(l for k, l in (("ground_engagement", "G"), ("pathway_engagement", "P"),
+                                        ("ends_ramp_down", "E")) if conditions[k]) or "-"
+            print(f"  run {i + 1}/{n}  seed {seed:>6}  [{on}]  {s['apartments']} apartments  "
+                  f"light {s['score_light']}  density {s['score_density']}  walking {s['score_walking']}  "
+                  f"overall {s['score_overall']}")
+            done.append(dict(gen=gen, result=result, row=row, seed=seed))
+            Rhino.UI.StatusBar.UpdateProgressMeter(i + 1, True)
+            Rhino.RhinoApp.Wait()                 # keep Rhino responsive (and Esc readable)
+    finally:
+        Rhino.UI.StatusBar.HideProgressMeter()
+    if not done:
+        return done
+
+    # the front among this batch's runs, on the chosen scores
+    chosen = pareto_scores_chosen()
+    flags = pareto_flags([tuple(r["result"]["summary"][f"score_{c}"] for c in chosen) for r in done])
+    front = [r for r, on in zip(done, flags) if on]
+    best = max(done, key=lambda r: r["result"]["summary"]["score_overall"])
+    print(f"Batch done: {len(done)} runs, {len(front)} on the Pareto front ({' / '.join(chosen)}) "
+          f"among these runs. Best overall: seed {best['seed']} ({best['result']['summary']['score_overall']}).")
+    if saved:                                     # the front over every run in the CSV file
+        print(format_front(saved, this_run=False))
+        print(f"Evaluation saved to {saved['folder']}")
+    if batch["draw"] == 1:
+        draw_run(best)
+        print(summary(best["gen"]["grid"], best["gen"]["cores"], best["gen"]["core_shared"],
+                      best["gen"]["apartments"], best["gen"]["scattered"], best["gen"]["filler"],
+                      best["gen"]["public"], best["gen"]["voids"], best["gen"]["crossings"]))
+        print(format_evaluation(best["result"]))
+    elif batch["draw"] == 2:
+        step = side_by_side_step([r["gen"]["grid"] for r in front])
+        for n_run, r in enumerate(sorted(front, key=lambda r: -r["result"]["summary"]["score_overall"])):
+            draw_run(r, step * n_run)
+        print(f"Drew {len(front)} front runs side by side, best overall first, each labelled with its seed.")
+    return done
+
+def side_by_side_step(grids: Sequence[Grid]) -> rg.Vector3d:
+    #How far to shift each drawn run so they sit side by side across the road's short direction,
+    #sized by the widest of the runs (their pods can spill different amounts)
+    c = np.concatenate([g.corners.reshape(-1, 3) for g in grids])
+    dx, dy = float(np.ptp(c[:, 0])), float(np.ptp(c[:, 1]))
+    gap = 2 * (grids[0].node_distance or 1.0)
+    if dx >= dy:
+        return rg.Vector3d(0, -(dy * 1.4 + gap), 0)
+    return rg.Vector3d(dx * 1.4 + gap, 0, 0)
+
+def draw_run(r: dict, offset: rg.Vector3d | None = None) -> None:
+    #Draw one batch run, shifted by `offset`, with a text dot naming its seed and scores
+    gen, s = r["gen"], r["result"]["summary"]
+    draw(gen["grid"], gen["cores"], gen["core_shared"], gen["apartments"], gen["scattered"],
+         gen["filler"], gen["public"], offset=offset, prefix=f"seed {r['seed']} - ")
+    c = gen["grid"].corners[0, 0, 0]
+    at = rg.Point3d(float(c[0]), float(c[1]), float(c[2]))
+    if offset is not None:
+        at += offset
+    if not rs.IsLayer(LAYER_ROOT):
+        rs.AddLayer(LAYER_ROOT)
+    attr = Rhino.DocObjects.ObjectAttributes()
+    attr.LayerIndex = sc.doc.Layers.FindByFullPath(LAYER_ROOT, -1)
+    sc.doc.Objects.AddTextDot(f"seed {r['seed']} | overall {s['score_overall']}", at, attr)
+    sc.doc.Views.Redraw()
 
 #=================================================
 #--------------------------------------------- MAIN
@@ -1748,7 +2112,7 @@ def number_row(field: dict):
     if field.get("hint"):
         label.ToolTip = box.ToolTip = field["hint"]
     slider = None
-    if "high" in field:
+    if "high" in field and field.get("slider", True):
         scale = 1 if is_int else 100
         slider = forms.Slider()
         slider.MinValue, slider.MaxValue = int(round(low * scale)), int(round(high * scale))
@@ -1873,6 +2237,26 @@ def ask_weights(owner=None) -> dict | None:
     room_box, room_boxes, _ = settings_section(
         "Privacy gradient", "How much each room facing public space counts.", room_fields)
 
+    # Pareto front: which scores to compare across runs
+    chosen = pareto_scores_chosen()
+    pareto_box = forms.GroupBox()
+    pareto_box.Text = "Pareto front"
+    pareto_box.Padding = drawing.Padding(10, 6, 10, 10)
+    pareto_layout = forms.TableLayout()
+    pareto_layout.Spacing = drawing.Size(10, 6)
+    pareto_layout.Rows.Add(forms.TableRow(forms.TableCell(hint_label(
+        "Scores compared across runs. Pick 2-3: with all five, almost every run is on the front."))))
+    pareto_checks = {}
+    labels = {"light": "Light / air", "community": "Community", "privacy": "Privacy gradient",
+              "density": "Density", "walking": "Walking to egress"}
+    for name in SCORE_NAMES:
+        check = forms.CheckBox()
+        check.Text = labels[name]
+        check.Checked = name in chosen
+        pareto_checks[name] = check
+        pareto_layout.Rows.Add(forms.TableRow(forms.TableCell(check)))
+    pareto_box.Content = pareto_layout
+
     dialog = forms.Dialog()
     dialog.Title = "Scoring weights"
     dialog.Padding = drawing.Padding(14)
@@ -1892,6 +2276,8 @@ def ask_weights(owner=None) -> dict | None:
         for boxes in (overall_boxes, light_boxes, room_boxes):
             for key, box in boxes.items():
                 box.Value = float(DEFAULT_WEIGHTS[key])
+        for name, check in pareto_checks.items():
+            check.Checked = name in DEFAULT_PARETO_SCORES
 
     ok.Click += on_ok
     cancel.Click += on_cancel
@@ -1899,7 +2285,7 @@ def ask_weights(owner=None) -> dict | None:
     dialog.DefaultButton, dialog.AbortButton = ok, cancel
 
     left, right = forms.StackLayout(), forms.StackLayout()
-    for column, boxes in ((left, (overall_box,)), (right, (light_box, room_box))):
+    for column, boxes in ((left, (overall_box, pareto_box)), (right, (light_box, room_box))):
         column.Spacing = 10
         column.HorizontalContentAlignment = forms.HorizontalAlignment.Stretch
         for b in boxes:
@@ -1921,6 +2307,10 @@ def ask_weights(owner=None) -> dict | None:
     for fields, boxes in ((overall_fields, overall_boxes), (light_fields, light_boxes), (room_fields, room_boxes)):
         values.update(read_numbers(fields, boxes))
     sc.sticky["evaluation_weights"] = values
+    picked = [name for name in SCORE_NAMES if pareto_checks[name].Checked]
+    sc.sticky["pareto_scores"] = picked if len(picked) >= 2 else list(DEFAULT_PARETO_SCORES)
+    if len(picked) < 2:
+        print("Pareto front needs at least 2 scores; using " + ", ".join(DEFAULT_PARETO_SCORES))
     return values
 
 def ask_settings(has_obstacles: bool) -> dict | None:
@@ -1932,7 +2322,7 @@ def ask_settings(has_obstacles: bool) -> dict | None:
     grid_last = remembered("grid_settings", {
         "dist": node_distance, "fh": floor_height or node_distance, "coverage": road_coverage,
         "spacing": vertcirc_spacing, "shared_weight": float(shared_space_weight),
-        "clearance": obstacle_clearance_ft * ft})
+        "clearance": obstacle_clearance_ft * ft, "seed": 0})
     on_last = remembered("conditions_on", {k: False for k in
                                            ("ground_engagement", "pathway_engagement", "ends_ramp_down")})
     ge_last = remembered("ground_engagement_settings", {
@@ -1956,6 +2346,10 @@ def ask_settings(has_obstacles: bool) -> dict | None:
         dict(key="shared_weight", label="Shared space", value=grid_last["shared_weight"], kind="float",
              low=0.0, high=10.0, step=0.25,
              hint="How often a shared space is placed instead of an apartment (0 = only leftover gaps)"),
+        dict(key="seed", label="Random seed", value=grid_last["seed"], kind="int", low=0, high=999999,
+             slider=False,
+             hint="0 = a new random layout every run. Any other number rebuilds the same layout "
+                  "(same road, settings and script). Each run's seed is printed and saved to the CSV"),
     ]
     if has_obstacles:
         grid_fields.append(dict(key="clearance", label="Obstacle clearance", value=grid_last["clearance"],
@@ -2009,6 +2403,18 @@ def ask_settings(has_obstacles: bool) -> dict | None:
         result["ok"] = True
         dialog.Close()
 
+    batch = forms.Button()
+    batch.Text = "Run batch..."
+    batch.ToolTip = "Generate and evaluate many runs with these settings, varying the ones you pick"
+
+    def on_batch(sender, e):
+        config = ask_batch(dialog, has_obstacles)
+        if config is not None:
+            result["ok"], result["batch"] = True, config
+            dialog.Close()
+
+    batch.Click += on_batch
+
     def on_cancel(sender, e):
         dialog.Close()
 
@@ -2025,7 +2431,7 @@ def ask_settings(has_obstacles: bool) -> dict | None:
     buttons = forms.TableLayout()
     buttons.Spacing = drawing.Size(8, 0)
     buttons.Rows.Add(forms.TableRow(forms.TableCell(None, True), forms.TableCell(cancel),
-                                    forms.TableCell(generate)))
+                                    forms.TableCell(batch), forms.TableCell(generate)))
     page = forms.TableLayout()
     page.Spacing = drawing.Size(12, 12)
     page.Rows.Add(forms.TableRow(forms.TableCell(left, True), forms.TableCell(right, True)))
@@ -2045,6 +2451,7 @@ def ask_settings(has_obstacles: bool) -> dict | None:
         "ground_engagement": read_numbers(ge_fields, ge_boxes),
         "pathway_engagement": read_numbers(pe_fields, pe_boxes),
         "ends_ramp_down": read_numbers(er_fields, er_boxes),
+        "batch": result.get("batch"),
     }
     sc.sticky["grid_settings"] = out["grid"]
     sc.sticky["conditions_on"] = {k: (v or (k == "pathway_engagement" and on_last[k] and not has_obstacles))
@@ -2069,71 +2476,39 @@ def main():
     settings = ask_settings(has_obstacles)
     if settings is None:
         return
+    if settings["batch"]:
+        run_batch(road, topo, obstacles, has_obstacles, settings, settings["batch"])
+        return
+
     grid_set, conditions = settings["grid"], settings["conditions"]
-    dist, fh, coverage = grid_set["dist"], grid_set["fh"], grid_set["coverage"]
-    spacing, shared_weight = grid_set["spacing"], grid_set["shared_weight"]
+    sections = {k: settings[k] for k in ("ground_engagement", "pathway_engagement", "ends_ramp_down")}
     clearance = grid_set["clearance"] if has_obstacles else 0.0
-    g, p_, e = settings["ground_engagement"], settings["pathway_engagement"], settings["ends_ramp_down"]
-    ge = ((g["spacing"], g["length"], g["spill"], g["floors"], g["void"])
-          if conditions["ground_engagement"] else None)
-    pe = ((p_["width"], p_["spill"], p_["floors"], p_["void"])
-          if conditions["pathway_engagement"] else None)
-    er = ((e["width"], e["spill"], e["floors"], e["void"])
-          if conditions["ends_ramp_down"] else None)
+    seed = int(grid_set.get("seed") or 0) or random.SystemRandom().randrange(1, 1000000)
+    print(f"Random seed: {seed}")
+    ge, pe, er = condition_tuples(conditions, sections)
 
     # ----- generate (internal only, nothing drawn yet)
-    margin = max(ge[2] if ge else 0, pe[1] if pe else 0, er[1] if er else 0)
-    grid = build_grid(road, topo, dist, fh, obstacles, clearance, margin, coverage)
+    grid = build_grid(road, topo, grid_set["dist"], grid_set["fh"], obstacles, clearance,
+                      grid_margin(ge, pe, er), grid_set["coverage"])
     if grid is None:
         return
-    # circulation first: cores, then the shared landings around them on every floor, so the
-    # engagement conditions below work around them and never take their place
-    cores = place_vertcirc(grid, spacing)
-    core_shared = place_core_shared(grid, cores)
-    public, voids, crossings = [], {}, 0
-    if ge:
-        g_spacing, g_length, g_spill, g_floors, g_void = ge
-        blocks, voids["Ground engagement"] = place_ground_engagement(
-            grid, g_spacing, g_length, g_spill, g_floors, void=g_void)
-        public += blocks
-    if pe:
-        p_width, p_spill, p_floors, p_void = pe
-        blocks, crossings, voids["Pathway engagement"] = place_pathway_engagement(
-            grid, p_width, p_spill, p_floors, void=p_void)
-        public += blocks
-        if crossings == 0:
-            print("Pathway engagement: no obstacle crosses under the road, nothing added")
-    if er:
-        e_width, e_spill, e_floors, e_void = er
-        blocks, voids["Ends / ramp down"] = place_ends_ramp_down(
-            grid, e_width, e_spill, e_floors, void=e_void)
-        public += blocks
-    apartments, scattered, filler = [], [], []
-    for k in range(grid.shape[2]):
-        a, s, f = populate(grid, floor=k, shared_weight=shared_weight)
-        apartments += a
-        scattered += s
-        filler += f
-    for n, apt in enumerate(apartments, 1):
-        apt.number = n
+    gen = generate(grid, grid_set["spacing"], grid_set["shared_weight"], ge, pe, er, seed)
 
     # ----- draw everything at the end
-    draw(grid, cores, core_shared, apartments, scattered, filler, public)
-    print(summary(grid, cores, core_shared, apartments, scattered, filler, public, voids, crossings))
+    draw(gen["grid"], gen["cores"], gen["core_shared"], gen["apartments"], gen["scattered"],
+         gen["filler"], gen["public"])
+    print(summary(gen["grid"], gen["cores"], gen["core_shared"], gen["apartments"], gen["scattered"],
+                  gen["filler"], gen["public"], gen["voids"], gen["crossings"]))
 
     # ----- evaluate, print and save to CSV
     ft = Rhino.RhinoMath.UnitScale(Rhino.UnitSystem.Feet, sc.doc.ModelUnitSystem)
-    result = evaluate(grid, cores, apartments, scattered, filler, ft,
+    result = evaluate(gen["grid"], gen["cores"], gen["apartments"], gen["scattered"], gen["filler"], ft,
                       remembered("evaluation_weights", DEFAULT_WEIGHTS))
     print(format_evaluation(result))
-    run_settings = dict(grid_set)
-    run_settings.update({k: v for k, v in conditions.items()})
-    for key, values in (("ground_engagement", g), ("pathway_engagement", p_), ("ends_ramp_down", e)):
-        if conditions[key]:
-            run_settings.update({f"{key}_{k}": v for k, v in values.items()})
-    folder = save_evaluation(result, run_settings)
-    if folder:
-        print(f"Evaluation saved to {folder}")
+    saved = save_evaluation(result, run_settings_row(grid_set, seed, conditions, sections))
+    if saved:
+        print(format_front(saved))
+        print(f"Evaluation saved to {saved['folder']}")
 
 if __name__ == "__main__":
     main()
