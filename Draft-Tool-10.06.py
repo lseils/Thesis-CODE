@@ -68,12 +68,13 @@ max_cell_skew = 45.0   # no corner more than this many degrees off a right angle
 min_cell_area = 0.6    # and at least this share of a full node_distance x node_distance cell
 
 # ---- Conditions (only used when "Conditions" is picked at run time)
-# Ground engagement: Public pods at an interval along the road. Each pod stands on the topo,
+# Ground engagement: a Public pod centered on every vertical circulation core that reaches the
+# topo (vertcirc_spacing sets how far apart they are). Each pod stands on the topo,
 # spills past the road edges in steps (widest at the ground and next to the building, shorter
 # the further out it reaches) and rises a few floors, each floor smaller than the one below.
 # Everywhere else, the floor touching the topo is left empty (open air).
-ge_spacing = 23      # nodes between pod centers along the road (asked at run time)
-ge_length = 10       # pod length along the road on the ground floor, in nodes (asked at run time)
+ge_length = 10       # pod length along the road on the ground floor, in nodes (asked at run time);
+                     # an even length grows by 1 so the pod is symmetric about its 1-node-wide core
 ge_spill = 4         # nodes the pod reaches past each road edge on the ground floor (asked at run time)
 ge_floors = 2        # floors of public, counted up from the topo (asked at run time)
 ge_taper = 1         # each step further out past the road edge, the pod is this many nodes shorter at each end
@@ -736,12 +737,6 @@ def merge_cells(cells: set[Node]) -> list[tuple[int, int, int, int, int]]:
                 j0 = prev = j
     return boxes
 
-def pod_centers(n_div: int, spacing: int) -> list[float]:
-    #Pod centers along the road (index i), `spacing` apart, the series centered on the road length
-    count = max(1, n_div // spacing)
-    mid = (n_div - 1) / 2
-    return [mid + (p - (count - 1) / 2) * spacing for p in range(count)]
-
 def build_pod(grid: Grid, center: float, length: int, spill: int, floors: int,
               taper: int = ge_taper, floor_step: int = ge_floor_step) -> set[Node]:
     #One stepped public pod centered on `center` (index i along the road), standing on the topo.
@@ -774,12 +769,13 @@ def build_pod(grid: Grid, center: float, length: int, spill: int, floors: int,
                         pod.add(Node(i, j, k))
     return pod
 
-def place_ground_engagement(grid: Grid, spacing: int = ge_spacing, length: int = ge_length,
+def place_ground_engagement(grid: Grid, cores: Sequence[Program], length: int = ge_length,
                             spill: int = ge_spill, floors: int = ge_floors,
                             taper: int = ge_taper, floor_step: int = ge_floor_step,
                             void: float = ge_void) -> tuple[list[Block], int]:
     #Runs after the cores and their shared landings, before anything else. Builds the public pods, then leaves
     #the floor touching the topo empty everywhere else.
+    #One pod per core that reaches the topo, centered on that core's final position along the road.
     #Returns (public blocks, number of void nodes).
     #A pod on floor f (0 = the cell on the topo) is made of steps s:
     #   s = 0         the road's own columns, `length - 2 * floor_step * f` nodes long
@@ -787,8 +783,15 @@ def place_ground_engagement(grid: Grid, spacing: int = ge_spacing, length: int =
     #                 up to `spill - floor_step * f` columns out
     #Every step and floor is centered on the pod center, so each one sits on the one below.
     n_div = grid.shape[0]
-    cells_by_pod = [build_pod(grid, center, length, spill, floors, taper, floor_step)
-                    for center in pod_centers(n_div, spacing)]
+    length += 1 - length % 2
+    cells_by_pod = []
+    for core in cores:
+        w, d, dk = core.footprint(core.rotated)
+        if core_grounded(grid, core.origin.i, core.origin.j, w, d, dk):
+            center = core.origin.i + (w - 1) / 2
+            cells_by_pod.append(build_pod(grid, center, length, spill, floors, taper, floor_step))
+    if not cells_by_pod:
+        print("Ground engagement: no core reaches the topo, so no pods were placed")
 
     voids = carve_voids(grid, cells_by_pod, void)
 
@@ -812,7 +815,8 @@ def carve_voids(grid: Grid, groups: Sequence[set[Node]], void: float) -> int:
     #Removes the voids from the groups and returns how many there are.
     voids = 0
     for cells in groups:
-        tops = sorted(n for n in cells if Node(n.i, n.j, n.k - 1) not in cells)
+        tops = sorted(n for n in cells
+                      if n.k == 0 or grid.states[n.i, n.j, n.k - 1] != ProgramState.PUBLIC)
         for n in random.sample(tops, min(len(tops), round(void * len(cells)))):
             grid.states[n] = ProgramState.OUTSIDE
             cells.discard(n)
@@ -1789,7 +1793,6 @@ def draw(grid: Grid, cores: Sequence[Program], core_shared: Sequence[Program],
 BATCH_PARAMS = [
     ("grid", "shared_weight", "Shared space weight", "float", 0.0, 10.0, 0.0, 4.0, True),
     ("grid", "spacing", "Core spacing", "int", 1, 60, 12, 28, True),
-    ("ground_engagement", "spacing", "Ground: pod spacing", "int", 1, 60, 15, 40, True),
     ("ground_engagement", "length", "Ground: pod length", "int", 1, 40, 6, 14, True),
     ("ground_engagement", "spill", "Ground: spill past edge", "int", 0, 10, 2, 6, False),
     ("ground_engagement", "floors", "Ground: public floors", "int", 1, 6, 1, 3, False),
@@ -1816,9 +1819,9 @@ def generate(base_grid: Grid, spacing: int, shared_weight: float, ge, pe, er, se
     core_shared = place_core_shared(grid, cores)
     public, voids, crossings = [], {}, 0
     if ge:
-        g_spacing, g_length, g_spill, g_floors, g_void = ge
+        g_length, g_spill, g_floors, g_void = ge
         blocks, voids["Ground engagement"] = place_ground_engagement(
-            grid, g_spacing, g_length, g_spill, g_floors, void=g_void)
+            grid, cores, g_length, g_spill, g_floors, void=g_void)
         public += blocks
     if pe:
         p_width, p_spill, p_floors, p_void = pe
@@ -1846,14 +1849,14 @@ def generate(base_grid: Grid, spacing: int, shared_weight: float, ge, pe, er, se
 def condition_tuples(conditions: dict, sections: dict):
     #(ge, pe, er) settings tuples for generate(), None for a condition that is off
     g, p, e = sections["ground_engagement"], sections["pathway_engagement"], sections["ends_ramp_down"]
-    ge = (g["spacing"], g["length"], g["spill"], g["floors"], g["void"]) if conditions["ground_engagement"] else None
+    ge = (g["length"], g["spill"], g["floors"], g["void"]) if conditions["ground_engagement"] else None
     pe = (p["width"], p["spill"], p["floors"], p["void"]) if conditions["pathway_engagement"] else None
     er = (e["width"], e["spill"], e["floors"], e["void"]) if conditions["ends_ramp_down"] else None
     return ge, pe, er
 
 def grid_margin(ge, pe, er) -> int:
     #Extra columns past each road edge the conditions need (their largest spill)
-    return max(ge[2] if ge else 0, pe[1] if pe else 0, er[1] if er else 0)
+    return max(ge[1] if ge else 0, pe[1] if pe else 0, er[1] if er else 0)
 
 def run_settings_row(grid_set: dict, seed: int, conditions: dict, sections: dict) -> dict:
     #The settings saved with a run in the runs CSV
@@ -2326,7 +2329,7 @@ def ask_settings(has_obstacles: bool) -> dict | None:
     on_last = remembered("conditions_on", {k: False for k in
                                            ("ground_engagement", "pathway_engagement", "ends_ramp_down")})
     ge_last = remembered("ground_engagement_settings", {
-        "spacing": ge_spacing, "length": ge_length, "spill": ge_spill, "floors": ge_floors, "void": ge_void})
+        "length": ge_length, "spill": ge_spill, "floors": ge_floors, "void": ge_void})
     pe_last = remembered("pathway_engagement_settings", {
         "width": pe_width, "spill": pe_spill, "floors": pe_floors, "void": pe_void})
     er_last = remembered("ends_ramp_down_settings", {
@@ -2356,8 +2359,6 @@ def ask_settings(has_obstacles: bool) -> dict | None:
                                 kind="float", low=0.0, step=1,
                                 hint="Nothing is built within this distance above an obstacle"))
     ge_fields = pod_section_fields(ge_last, [
-        dict(key="spacing", label="Pod spacing", value=ge_last["spacing"], kind="int", low=1, high=60,
-             hint="Nodes between pod centers along the road"),
         dict(key="length", label="Pod length", value=ge_last["length"], kind="int", low=1, high=40,
              hint="Pod length along the road on the ground floor, in nodes"),
     ])
@@ -2373,7 +2374,7 @@ def ask_settings(has_obstacles: bool) -> dict | None:
     grid_box, grid_boxes, _ = settings_section(
         "Grid and circulation", "Leave every condition off for Normal.", grid_fields)
     ge_box, ge_boxes, ge_check = settings_section(
-        "Ground engagement", "Public pods at an interval, standing on the topo.", ge_fields,
+        "Ground engagement", "A public pod centered on each core that reaches the topo.", ge_fields,
         toggle={"label": "Use ground engagement", "value": on_last["ground_engagement"]})
     pe_box, pe_boxes, pe_check = settings_section(
         "Pathway engagement",
